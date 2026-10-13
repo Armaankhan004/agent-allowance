@@ -56,12 +56,26 @@ def init_db(db_path: Optional[str] = None) -> None:
             evaluation_reason TEXT, -- Semicolon-delimited summary string
             raw_proposal TEXT, -- JSON dump of the original proposal
             paypal_order_id TEXT,
+            paypal_approval_url TEXT,
             paypal_capture_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+
+    # Automatically add any missing columns if table was created in an older version
+    cursor.execute("PRAGMA table_info(transactions)")
+    existing_cols = {row["name"] for row in cursor.fetchall()}
+    needed_cols = {
+        "reason": "TEXT",
+        "reasons": "TEXT",
+        "raw_proposal": "TEXT",
+        "paypal_approval_url": "TEXT",
+    }
+    for col_name, col_type in needed_cols.items():
+        if col_name not in existing_cols:
+            cursor.execute(f"ALTER TABLE transactions ADD COLUMN {col_name} {col_type}")
 
     # Table 3: Audit Log (Detailed step-by-step trace of policy checks and decisions)
     cursor.execute(
@@ -102,7 +116,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "Allowed Merchants Allowlist",
                 "Only approved commercial vendors may be used by the agent (case-insensitive).",
                 "allowed_merchants",
-                "Amazon, Target, Best Buy, Walmart, GitHub, DigitalOcean, Office Depot",
+                "Golden Grain Mills, EcoPack Supplies, Office Depot, Amazon, Target, Best Buy, Walmart, GitHub, DigitalOcean",
                 "BLOCK",
                 1,
             ),

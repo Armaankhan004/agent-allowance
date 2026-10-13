@@ -348,6 +348,61 @@ def approve_pending(
             f"Cannot approve transaction {ledger_id}: current status is '{row['status']}', expected 'NEEDS_APPROVAL'."
         )
 
+    # Re-check monthly budget before approving
+    cursor.execute(
+        "SELECT condition_value FROM rules WHERE rule_type = 'monthly_budget' AND is_active = 1"
+    )
+    budget_row = cursor.fetchone()
+    if budget_row:
+        try:
+            monthly_budget = Decimal(str(budget_row["condition_value"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            item_amount = Decimal(str(row["amount"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            target_month = (row["created_at"] or "")[:7] or datetime.now(timezone.utc).strftime("%Y-%m")
+            current_approved = get_monthly_approved_spend(db_path=db_path, month_prefix=target_month)
+            projected = current_approved + item_amount
+            if projected > monthly_budget:
+                refusal_reason = (
+                    f"Approval refused: Transaction amount ${item_amount:.2f} would bring "
+                    f"monthly approved spend to ${projected:.2f}, exceeding the monthly "
+                    f"budget of ${monthly_budget:.2f} (current approved spend: ${current_approved:.2f})."
+                )
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    """
+                    INSERT INTO audit_logs (proposal_id, step, result, details, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["proposal_id"],
+                        "HUMAN_APPROVAL_REFUSED",
+                        "REFUSED",
+                        refusal_reason,
+                        now_str,
+                    ),
+                )
+                conn.commit()
+                conn.close()
+                existing_reasons = []
+                try:
+                    existing_reasons = json.loads(row["reasons"] or "[]")
+                except Exception:
+                    pass
+                return {
+                    "ledger_id": ledger_id,
+                    "proposal_id": row["proposal_id"],
+                    "status": "NEEDS_APPROVAL",
+                    "approved": False,
+                    "error": refusal_reason,
+                    "refusal_reason": refusal_reason,
+                    "reasons": existing_reasons + [refusal_reason],
+                }
+        except (InvalidOperation, ValueError):
+            pass
+
     # Parse existing reasons and append approval note
     existing_reasons = []
     try:
@@ -398,6 +453,7 @@ def approve_pending(
         "ledger_id": ledger_id,
         "proposal_id": row["proposal_id"],
         "status": "APPROVED",
+        "approved": True,
         "reasons": existing_reasons,
     }
 

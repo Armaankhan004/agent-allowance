@@ -251,3 +251,86 @@ def test_human_rejection_flow(test_db):
 
     # Monthly spend remains 0
     assert get_monthly_approved_spend(db_path=test_db) == Decimal("0.00")
+
+
+def test_approve_pending_refuses_when_monthly_budget_exceeded(test_db):
+    """
+    approve_pending must re-check the monthly budget. If approving would exceed the
+    monthly budget, it must refuse approval and retain NEEDS_APPROVAL status.
+    """
+    # 1. Create a proposal that needs human approval ($30.00)
+    proposal = {
+        "merchant": "Target",
+        "amount": "30.00",
+        "currency": "USD",
+        "category": "Supplies",
+        "reason": "Office supplies pack",
+    }
+    decision = evaluate_proposal(proposal, db_path=test_db)
+    assert decision.status == "NEEDS_APPROVAL"
+
+    # 2. In the meantime, other transactions spend $185.00 of the $200.00 budget
+    conn = get_db_connection(test_db)
+    conn.execute(
+        """
+        INSERT INTO transactions (proposal_id, merchant, amount, currency, category, reason, status)
+        VALUES ('prop-fill-budget', 'Amazon', 185.00, 'USD', 'Supplies', 'Bulk paper', 'APPROVED')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # 3. Attempt to approve the $30.00 item ($185 + $30 = $215 > $200)
+    result = approve_pending(decision.ledger_id, db_path=test_db)
+
+    assert result["approved"] is False
+    assert result["status"] == "NEEDS_APPROVAL"
+    assert "Approval refused" in result["refusal_reason"]
+    assert "exceeding the monthly budget" in result["refusal_reason"]
+
+    # 4. Verify DB transaction status is still NEEDS_APPROVAL
+    conn = get_db_connection(test_db)
+    row = conn.execute("SELECT status FROM transactions WHERE id = ?", (decision.ledger_id,)).fetchone()
+    conn.close()
+    assert row["status"] == "NEEDS_APPROVAL"
+
+
+def test_amount_exactly_equal_to_max_per_purchase_is_allowed(test_db):
+    """
+    An amount exactly equal to max_per_purchase ($50.00) must be allowed
+    and NOT blocked by the per-purchase cap.
+    """
+    # Test with default rules where max_per_purchase is 50.00 and approval_threshold is 25.00
+    proposal = {
+        "merchant": "Target",
+        "amount": "50.00",
+        "currency": "USD",
+        "category": "Hardware",
+        "reason": "Desk organizer",
+    }
+    decision = evaluate_proposal(proposal, db_path=test_db)
+
+    # It requires human approval (since 50.00 > 25.00), but is NOT BLOCKED by the 50.00 cap!
+    assert decision.status == "NEEDS_APPROVAL"
+    assert not any("exceeds the maximum per-purchase limit" in r for r in decision.reasons)
+
+    # Now adjust approval_threshold to 50.00 in rules to confirm exact boundary auto-approval
+    conn = get_db_connection(test_db)
+    conn.execute(
+        "UPDATE rules SET condition_value = '50.00' WHERE rule_type = 'approval_threshold'"
+    )
+    conn.commit()
+    conn.close()
+
+    proposal_exact = {
+        "merchant": "Amazon",
+        "amount": "50.00",
+        "currency": "USD",
+        "category": "Hardware",
+        "reason": "Exact boundary item",
+    }
+    decision_exact = evaluate_proposal(proposal_exact, db_path=test_db)
+    # Exactly equal to threshold and cap is fully APPROVED
+    assert decision_exact.status == "APPROVED"
+    assert not any("exceeds" in r for r in decision_exact.reasons)
+
