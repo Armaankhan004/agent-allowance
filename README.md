@@ -1,5 +1,8 @@
 # 🛡️ Agent Allowance
 
+[![Tests](https://github.com/Armaankhan004/agent-allowance/actions/workflows/tests.yml/badge.svg)](https://github.com/Armaankhan004/agent-allowance/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 > **Deterministic Financial Guardrails for Autonomous AI Agents**  
 > *PayPal Sandbox Integration Hackathon Project*
 
