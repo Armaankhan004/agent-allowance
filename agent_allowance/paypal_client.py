@@ -48,9 +48,21 @@ class PayPalSandboxClient:
         client_secret: Optional[str] = None,
         base_url: Optional[str] = None,
     ):
-        self.client_id = client_id or Config.PAYPAL_CLIENT_ID or os.getenv("PAYPAL_CLIENT_ID", "")
-        self.client_secret = client_secret or Config.PAYPAL_CLIENT_SECRET or os.getenv("PAYPAL_CLIENT_SECRET", "")
-        self.base_url = base_url or Config.PAYPAL_API_BASE_URL or self.SANDBOX_BASE_URL
+        self.client_id = (
+            client_id
+            if client_id is not None
+            else (Config.PAYPAL_CLIENT_ID or os.getenv("PAYPAL_CLIENT_ID", ""))
+        )
+        self.client_secret = (
+            client_secret
+            if client_secret is not None
+            else (Config.PAYPAL_CLIENT_SECRET or os.getenv("PAYPAL_CLIENT_SECRET", ""))
+        )
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else (Config.PAYPAL_API_BASE_URL or self.SANDBOX_BASE_URL)
+        )
 
         # Token caching
         self._access_token: Optional[str] = None

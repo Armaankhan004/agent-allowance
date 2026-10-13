@@ -28,9 +28,9 @@ def init_db(db_path: Optional[str] = None) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             rule_name TEXT NOT NULL UNIQUE,
             description TEXT,
-            rule_type TEXT NOT NULL, -- 'MAX_PER_TRANSACTION', 'DAILY_ALLOWANCE', 'ALLOWED_CATEGORY', 'FORBIDDEN_CATEGORY', 'APPROVAL_THRESHOLD'
-            condition_value TEXT NOT NULL, -- Threshold amount or comma-separated list of categories/tags
-            action TEXT NOT NULL, -- 'APPROVE', 'BLOCK', 'ESCALATE'
+            rule_type TEXT NOT NULL, -- 'max_per_purchase', 'monthly_budget', 'allowed_merchants', 'approval_threshold'
+            condition_value TEXT NOT NULL, -- Threshold amount or comma-separated list of merchants/categories
+            action TEXT NOT NULL, -- 'BLOCK', 'NEEDS_APPROVAL', 'APPROVE'
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -43,15 +43,18 @@ def init_db(db_path: Optional[str] = None) -> None:
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             proposal_id TEXT NOT NULL UNIQUE,
-            agent_name TEXT NOT NULL,
-            item_id TEXT NOT NULL,
-            item_title TEXT NOT NULL,
-            category TEXT NOT NULL,
             merchant TEXT NOT NULL,
             amount REAL NOT NULL,
             currency TEXT NOT NULL DEFAULT 'USD',
-            status TEXT NOT NULL, -- 'PROPOSED', 'APPROVED', 'BLOCKED', 'ESCALATED', 'EXECUTED', 'REJECTED'
-            evaluation_reason TEXT,
+            category TEXT NOT NULL,
+            reason TEXT,
+            agent_name TEXT DEFAULT 'Shopping Agent',
+            item_id TEXT DEFAULT '',
+            item_title TEXT DEFAULT '',
+            status TEXT NOT NULL, -- 'APPROVED', 'BLOCKED', 'NEEDS_APPROVAL', 'REJECTED', 'EXECUTED'
+            reasons TEXT, -- JSON array of plain-English evaluation strings
+            evaluation_reason TEXT, -- Semicolon-delimited summary string
+            raw_proposal TEXT, -- JSON dump of the original proposal
             paypal_order_id TEXT,
             paypal_capture_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -80,35 +83,35 @@ def init_db(db_path: Optional[str] = None) -> None:
     if count == 0:
         default_rules = [
             (
-                "Hard Cap Per Transaction",
-                "Transactions over $75.00 are strictly blocked.",
-                "MAX_PER_TRANSACTION",
-                "75.00",
+                "Max Single Purchase Cap",
+                "Transactions over $50.00 are strictly blocked.",
+                "max_per_purchase",
+                "50.00",
                 "BLOCK",
                 1,
             ),
             (
-                "Human Escalation Threshold",
-                "Transactions between $30.00 and $75.00 require human escalation/approval.",
-                "APPROVAL_THRESHOLD",
-                "30.00",
-                "ESCALATE",
-                1,
-            ),
-            (
-                "Daily Budget Cap",
-                "Cumulative approved transactions cannot exceed $150.00 per day.",
-                "DAILY_ALLOWANCE",
-                "150.00",
+                "Monthly Allowance Budget",
+                "Total approved spend in the current calendar month cannot exceed $200.00.",
+                "monthly_budget",
+                "200.00",
                 "BLOCK",
                 1,
             ),
             (
-                "Forbidden Categories",
-                "Certain high-risk or prohibited categories are blocked automatically.",
-                "FORBIDDEN_CATEGORY",
-                "gift_cards,crypto,gambling,adult",
+                "Allowed Merchants Allowlist",
+                "Only approved commercial vendors may be used by the agent (case-insensitive).",
+                "allowed_merchants",
+                "Amazon, Target, Best Buy, Walmart, GitHub, DigitalOcean, Office Depot",
                 "BLOCK",
+                1,
+            ),
+            (
+                "Human Approval Threshold",
+                "Transactions exceeding $25.00 require human confirmation before execution.",
+                "approval_threshold",
+                "25.00",
+                "NEEDS_APPROVAL",
                 1,
             ),
         ]
