@@ -152,7 +152,7 @@ def test_capture_if_approved_success(mock_capture_order, test_db):
     cursor.execute(
         """
         INSERT INTO transactions (proposal_id, merchant, amount, currency, category, reason, status, paypal_order_id)
-        VALUES ('prop-approved-1', 'Office Depot', 8.49, 'USD', 'Office Supplies', 'Copy paper', 'APPROVED', 'ORD-READY')
+        VALUES ('prop-approved-1', 'Corner Office Supply', 8.49, 'USD', 'Office Supplies', 'Copy paper', 'APPROVED', 'ORD-READY')
         """
     )
     ledger_id = cursor.lastrowid
@@ -181,7 +181,7 @@ def test_capture_if_approved_refuses_unapproved(test_db):
     cursor.execute(
         """
         INSERT INTO transactions (proposal_id, merchant, amount, currency, category, reason, status)
-        VALUES ('prop-pending-1', 'Target', 35.00, 'USD', 'Supplies', 'Lamp', 'NEEDS_APPROVAL')
+        VALUES ('prop-pending-1', 'Beacon Mart', 35.00, 'USD', 'Supplies', 'Lamp', 'NEEDS_APPROVAL')
         """
     )
     ledger_id = cursor.lastrowid
@@ -191,3 +191,156 @@ def test_capture_if_approved_refuses_unapproved(test_db):
     with pytest.raises(ValueError) as exc:
         capture_if_approved(ledger_id, db_path=test_db)
     assert "expected 'APPROVED'" in str(exc.value)
+
+
+# ==============================================================================
+# Gemini Provider Tests (Mocked Network Calls - Zero Real Network)
+# ==============================================================================
+
+
+def test_gemini_missing_api_key_returns_clear_error(test_db):
+    """
+    If LLM_PROVIDER=gemini and the API key is missing, the agent must return a clear error message.
+    It must NOT crash and must NOT silently switch to mock mode.
+    """
+    agent = ShoppingAgent(provider="gemini", api_key="", db_path=test_db)
+    result = agent.run("Buy paper")
+
+    assert "error" in result
+    assert "missing" in result["error"].lower() or "not configured" in result["error"].lower()
+    assert result["proposal_result"] is None
+    assert len(result["tool_calls"]) == 0
+    assert "Error:" in result["agent_response"]
+
+
+@patch("agent_allowance.agent.create_order")
+@patch("agent_allowance.agent.genai.Client")
+def test_gemini_mocked_network_tool_loop_approved(mock_genai_client_cls, mock_create_order, test_db):
+    """
+    Verify Gemini provider tool-call loop:
+    1. Turn 1: Model calls search_products('paper')
+    2. Tool result contains sanitized catalog with untrusted data notices
+    3. Turn 2: Model calls propose_purchase for Corner Office Supply
+    4. Deterministic policy engine approves purchase
+    5. Turn 3: Model returns final response text
+    6. Ensures zero real network calls.
+    """
+    from google.genai import types
+
+    mock_create_order.return_value = PayPalOrderResult(
+        order_id="SANDBOX-GEMINI-001",
+        approval_url="https://www.sandbox.paypal.com/checkoutnow?token=SANDBOX-GEMINI-001",
+    )
+
+    # Turn 1: search_products call
+    fc_search = types.FunctionCall(name="search_products", args={"query": "paper"})
+    cand1 = types.Candidate(content=types.Content(role="model", parts=[types.Part(function_call=fc_search)]))
+    resp1 = types.GenerateContentResponse(candidates=[cand1])
+
+    # Turn 2: propose_purchase call
+    fc_propose = types.FunctionCall(
+        name="propose_purchase",
+        args={
+            "merchant": "Corner Office Supply",
+            "amount": 8.49,
+            "currency": "USD",
+            "category": "Office Supplies",
+            "reason": "Replenishing copy paper",
+        },
+    )
+    cand2 = types.Candidate(content=types.Content(role="model", parts=[types.Part(function_call=fc_propose)]))
+    resp2 = types.GenerateContentResponse(candidates=[cand2])
+
+    # Turn 3: final text response
+    part_text = types.Part.from_text(text="I have proposed the purchase of copy paper and it was auto-approved.")
+    cand3 = types.Candidate(content=types.Content(role="model", parts=[part_text]))
+    resp3 = types.GenerateContentResponse(candidates=[cand3])
+
+    # Configure client mock
+    mock_client_instance = mock_genai_client_cls.return_value
+    mock_client_instance.models.generate_content.side_effect = [resp1, resp2, resp3]
+
+    tools_called = []
+    policies_evaluated = []
+
+    def on_tool(name, args):
+        tools_called.append((name, args))
+
+    def on_policy(decision):
+        policies_evaluated.append(decision)
+
+    agent = ShoppingAgent(provider="gemini", api_key="test-gemini-key", db_path=test_db)
+    result = agent.run(
+        "Please order copy paper",
+        on_tool_call=on_tool,
+        on_policy_decision=on_policy,
+    )
+
+    # Verify tool calls executed
+    assert len(result["tool_calls"]) == 2
+    assert result["tool_calls"][0]["tool"] == "search_products"
+    assert result["tool_calls"][1]["tool"] == "propose_purchase"
+    assert len(tools_called) == 2
+    assert len(policies_evaluated) == 1
+
+    # Verify policy evaluation result
+    assert result["proposal_result"]["status"] == "APPROVED"
+    assert result["proposal_result"]["paypal_order_id"] == "SANDBOX-GEMINI-001"
+    assert "auto-approved" in result["agent_response"]
+
+    # Verify that contents passed to generate_content contained untrusted catalog label
+    call_args_list = mock_client_instance.models.generate_content.call_args_list
+    assert len(call_args_list) == 3
+    # Turn 2 input contents should contain function response with untrusted warning
+    turn2_contents = call_args_list[1].kwargs["contents"]
+    turn2_tool_response = str(turn2_contents)
+    assert "UNTRUSTED" in turn2_tool_response
+
+
+@patch("agent_allowance.agent.genai.Client")
+def test_gemini_api_error_returns_clear_error_and_never_leaks_key(mock_genai_client_cls, test_db):
+    """
+    If the Gemini API call fails, return a clear error message, never crash, never silently fall back
+    to mock mode, and never leak the API key in the response or error message.
+    """
+    secret_key = "AIzaSySuperSecretKey123456789"
+    mock_client_instance = mock_genai_client_cls.return_value
+    mock_client_instance.models.generate_content.side_effect = Exception(
+        f"API Error 403 Forbidden with auth token {secret_key}"
+    )
+
+    agent = ShoppingAgent(provider="gemini", api_key=secret_key, db_path=test_db)
+    result = agent.run("Order coffee")
+
+    assert "error" in result
+    assert "Gemini API request failed" in result["error"]
+    assert secret_key not in result["error"]
+    assert secret_key not in result["agent_response"]
+    assert "[REDACTED_API_KEY]" in result["error"]
+    # Not silent mock mode
+    assert result["proposal_result"] is None
+
+
+@patch("agent_allowance.agent.genai.Client")
+def test_gemini_max_iteration_limit(mock_genai_client_cls, test_db):
+    """
+    Verify the tool loop enforces a max-iteration limit (6) so the agent cannot loop indefinitely.
+    """
+    from google.genai import types
+
+    fc = types.FunctionCall(name="search_products", args={"query": "paper"})
+    cand = types.Candidate(content=types.Content(role="model", parts=[types.Part(function_call=fc)]))
+    loop_response = types.GenerateContentResponse(candidates=[cand])
+
+    mock_client_instance = mock_genai_client_cls.return_value
+    # Infinite loop response simulation
+    mock_client_instance.models.generate_content.return_value = loop_response
+
+    agent = ShoppingAgent(provider="gemini", api_key="dummy-key", db_path=test_db)
+    result = agent.run("Need infinite paper")
+
+    # Should hit exactly 6 iterations and exit gracefully
+    assert mock_client_instance.models.generate_content.call_count == 6
+    assert len(result["tool_calls"]) == 6
+    assert "Completed 6 iterations" in result["thought"]
+

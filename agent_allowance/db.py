@@ -116,7 +116,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "Allowed Merchants Allowlist",
                 "Only approved commercial vendors may be used by the agent (case-insensitive).",
                 "allowed_merchants",
-                "Golden Grain Mills, EcoPack Supplies, Office Depot, Amazon, Target, Best Buy, Walmart, GitHub, DigitalOcean",
+                "Golden Grain Mills, EcoPack Supplies, Corner Office Supply, Nexus Retail, Beacon Mart, Zenith Electronics, Prairie Goods, CodeHaven, CloudByte",
                 "BLOCK",
                 1,
             ),
@@ -135,6 +135,15 @@ def init_db(db_path: Optional[str] = None) -> None:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             default_rules,
+        )
+    else:
+        # Migrate existing rules to replace legacy real brands with fictional ones
+        cursor.execute(
+            """
+            UPDATE rules
+            SET condition_value = 'Golden Grain Mills, EcoPack Supplies, Corner Office Supply, Nexus Retail, Beacon Mart, Zenith Electronics, Prairie Goods, CodeHaven, CloudByte'
+            WHERE rule_type = 'allowed_merchants' AND condition_value LIKE '%Office Depot%'
+            """
         )
 
     conn.commit()

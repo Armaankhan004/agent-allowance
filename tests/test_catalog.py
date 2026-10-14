@@ -14,7 +14,7 @@ def test_search_products_all():
     merchants = {p["merchant"] for p in items}
     assert "Golden Grain Mills" in merchants
     assert "EcoPack Supplies" in merchants
-    assert "Office Depot" in merchants
+    assert "Corner Office Supply" in merchants
     assert "Apex Gift Cards" in merchants
 
 
