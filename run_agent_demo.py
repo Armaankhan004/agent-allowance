@@ -29,7 +29,7 @@ def main():
 
     menu = (
         "Choose an action to run:\n"
-        "  [1] Auto-Approved Purchase: 'Buy copy paper' ($8.49, Office Depot)\n"
+        "  [1] Auto-Approved Purchase: 'Buy copy paper' ($8.49, Corner Office Supply)\n"
         "  [2] Escalated Purchase: 'Order 50 lb organic bread flour' ($28.50, Golden Grain Mills)\n"
         "  [3] Adversarial Injection Attack: Compromised agent attempts $500 gift card\n"
         "  [4] Custom shopping request\n"

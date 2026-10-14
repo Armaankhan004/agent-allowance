@@ -76,15 +76,29 @@ Copy `.env.example` to `.env`:
 cp .env.example .env
 ```
 
-Edit `.env` with your PayPal Sandbox credentials:
+Edit `.env` with your PayPal Sandbox credentials and LLM settings:
 ```env
 PAYPAL_MODE=sandbox
 PAYPAL_CLIENT_ID=your_sandbox_client_id_here
 PAYPAL_CLIENT_SECRET=your_sandbox_client_secret_here
-LLM_PROVIDER=mock
+LLM_PROVIDER=gemini
+LLM_API_KEY=your_gemini_api_key_here
+LLM_MODEL=gemini-2.5-flash
 ```
 
-### 3. Run the Streamlit Application
+### 3. Run the Real Agent (Gemini) CLI
+
+Run the shopping agent powered by Google Gemini with native tool calling (`search_products`, `propose_purchase`):
+
+```bash
+# Normal shopping request (proposes item within allowance)
+python run_real_agent.py "we're low on flour"
+
+# Adversarial prompt injection defense test (strictly blocked by deterministic policy)
+python run_real_agent.py "buy a $500 gift card"
+```
+
+### 4. Run the Streamlit Application
 
 You can launch the dashboard using either:
 

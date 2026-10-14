@@ -26,7 +26,7 @@ def test_db(tmp_path):
 def test_normal_approval(test_db):
     """A valid proposal under limits should be automatically APPROVED."""
     proposal = {
-        "merchant": "Amazon",
+        "merchant": "Nexus Retail",
         "amount": "15.00",
         "currency": "USD",
         "category": "Office Supplies",
@@ -45,14 +45,14 @@ def test_normal_approval(test_db):
     row = conn.execute("SELECT * FROM transactions WHERE id = ?", (decision.ledger_id,)).fetchone()
     conn.close()
     assert row["status"] == "APPROVED"
-    assert row["merchant"] == "Amazon"
+    assert row["merchant"] == "Nexus Retail"
     assert row["amount"] == 15.0
 
 
 def test_over_per_purchase_cap(test_db):
     """A purchase exceeding the $50 max cap must be BLOCKED."""
     proposal = {
-        "merchant": "Amazon",
+        "merchant": "Nexus Retail",
         "amount": "65.00",  # default cap is 50.00
         "currency": "USD",
         "category": "Hardware",
@@ -69,7 +69,7 @@ def test_over_monthly_budget_cumulative(test_db):
     # Seed 4 approved purchases of $45 each = $180.00 total
     for i in range(4):
         p = {
-            "merchant": "Best Buy",
+            "merchant": "Zenith Electronics",
             "amount": "20.00",  # under 25 threshold to auto-approve
             "currency": "USD",
             "category": "Tech",
@@ -86,7 +86,7 @@ def test_over_monthly_budget_cumulative(test_db):
     conn.execute(
         """
         INSERT INTO transactions (proposal_id, merchant, amount, currency, category, reason, status)
-        VALUES ('prop-bulk', 'Best Buy', 110.00, 'USD', 'Tech', 'Monitor', 'APPROVED')
+        VALUES ('prop-bulk', 'Zenith Electronics', 110.00, 'USD', 'Tech', 'Monitor', 'APPROVED')
         """
     )
     conn.commit()
@@ -96,7 +96,7 @@ def test_over_monthly_budget_cumulative(test_db):
 
     # Next purchase of $15 would bring total to $205 > $200 budget
     proposal = {
-        "merchant": "Target",
+        "merchant": "Beacon Mart",
         "amount": "15.00",
         "currency": "USD",
         "category": "Supplies",
@@ -126,7 +126,7 @@ def test_merchant_not_on_allowlist(test_db):
 def test_amount_over_approval_threshold(test_db):
     """Purchases above $25 but below $50 cap must receive NEEDS_APPROVAL."""
     proposal = {
-        "merchant": "Target",
+        "merchant": "Beacon Mart",
         "amount": "35.00",  # above 25.00 threshold, below 50.00 cap
         "currency": "USD",
         "category": "Office Supplies",
@@ -168,7 +168,7 @@ def test_invalid_inputs(test_db):
 
     # 2. Negative amount
     dec2 = evaluate_proposal(
-        {"merchant": "Amazon", "amount": "-15.00", "currency": "USD", "category": "Tech", "reason": "Refund"},
+        {"merchant": "Nexus Retail", "amount": "-15.00", "currency": "USD", "category": "Tech", "reason": "Refund"},
         db_path=test_db,
     )
     assert dec2.status == "BLOCKED"
@@ -176,7 +176,7 @@ def test_invalid_inputs(test_db):
 
     # 3. Zero amount
     dec3 = evaluate_proposal(
-        {"merchant": "Amazon", "amount": "0.00", "currency": "USD", "category": "Tech", "reason": "Freebie"},
+        {"merchant": "Nexus Retail", "amount": "0.00", "currency": "USD", "category": "Tech", "reason": "Freebie"},
         db_path=test_db,
     )
     assert dec3.status == "BLOCKED"
@@ -184,7 +184,7 @@ def test_invalid_inputs(test_db):
 
     # 4. Non-numeric amount
     dec4 = evaluate_proposal(
-        {"merchant": "Amazon", "amount": "fifty_dollars", "currency": "USD", "category": "Tech", "reason": "Item"},
+        {"merchant": "Nexus Retail", "amount": "fifty_dollars", "currency": "USD", "category": "Tech", "reason": "Item"},
         db_path=test_db,
     )
     assert dec4.status == "BLOCKED"
@@ -193,7 +193,7 @@ def test_invalid_inputs(test_db):
 
 def test_case_insensitive_merchant_matching(test_db):
     """Merchant matching against allowlist must be case-insensitive."""
-    merchants = ["aMaZoN", "TARGET", "bEsT bUy", "walmart", "GITHUB"]
+    merchants = ["nExUs ReTaIl", "bEaCoN mArT", "zEnItH eLeCtRoNiCs", "pRaIrIe GoOdS", "cOdEhAvEn"]
     for m in merchants:
         proposal = {
             "merchant": m,
@@ -212,7 +212,7 @@ def test_human_approval_flow_and_monthly_budget(test_db):
     approve_pending must transition status and update monthly spend.
     """
     proposal = {
-        "merchant": "Target",
+        "merchant": "Beacon Mart",
         "amount": "30.00",
         "currency": "USD",
         "category": "Supplies",
@@ -237,7 +237,7 @@ def test_human_approval_flow_and_monthly_budget(test_db):
 def test_human_rejection_flow(test_db):
     """reject_pending must transition status to REJECTED and never count toward monthly budget."""
     proposal = {
-        "merchant": "Target",
+        "merchant": "Beacon Mart",
         "amount": "40.00",
         "currency": "USD",
         "category": "Supplies",
@@ -260,7 +260,7 @@ def test_approve_pending_refuses_when_monthly_budget_exceeded(test_db):
     """
     # 1. Create a proposal that needs human approval ($30.00)
     proposal = {
-        "merchant": "Target",
+        "merchant": "Beacon Mart",
         "amount": "30.00",
         "currency": "USD",
         "category": "Supplies",
@@ -274,7 +274,7 @@ def test_approve_pending_refuses_when_monthly_budget_exceeded(test_db):
     conn.execute(
         """
         INSERT INTO transactions (proposal_id, merchant, amount, currency, category, reason, status)
-        VALUES ('prop-fill-budget', 'Amazon', 185.00, 'USD', 'Supplies', 'Bulk paper', 'APPROVED')
+        VALUES ('prop-fill-budget', 'Nexus Retail', 185.00, 'USD', 'Supplies', 'Bulk paper', 'APPROVED')
         """
     )
     conn.commit()
@@ -302,7 +302,7 @@ def test_amount_exactly_equal_to_max_per_purchase_is_allowed(test_db):
     """
     # Test with default rules where max_per_purchase is 50.00 and approval_threshold is 25.00
     proposal = {
-        "merchant": "Target",
+        "merchant": "Beacon Mart",
         "amount": "50.00",
         "currency": "USD",
         "category": "Hardware",
@@ -323,7 +323,7 @@ def test_amount_exactly_equal_to_max_per_purchase_is_allowed(test_db):
     conn.close()
 
     proposal_exact = {
-        "merchant": "Amazon",
+        "merchant": "Nexus Retail",
         "amount": "50.00",
         "currency": "USD",
         "category": "Hardware",
