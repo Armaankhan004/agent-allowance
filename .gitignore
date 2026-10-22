@@ -41,8 +41,9 @@ env/
 htmlcov/
 
 # Streamlit
-.streamlit/
-!/.streamlit/config.toml
+.streamlit/*
+!.streamlit/config.toml
+
 
 # IDE / OS
 .DS_Store

@@ -1,0 +1,39 @@
+# Agent Allowance theme (Streamlit 1.65).
+#
+# ROOT CAUSE of the old "black input boxes": `secondaryBackgroundColor` was set to
+# navy (#0F172A). Streamlit uses secondaryBackgroundColor as the fill for text
+# inputs, text areas, number inputs, selects and chat input, so every widget in the
+# main area turned navy with navy text. The global theme is now light, and the navy
+# palette is scoped to the sidebar through [theme.sidebar] (supported in 1.65,
+# verified against streamlit.config option registry).
+
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#F7F8FA"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#0F172A"
+borderColor = "#CBD5E1"
+showWidgetBorder = true
+linkColor = "#2563EB"
+baseRadius = "10px"
+buttonRadius = "10px"
+font = "Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+codeBackgroundColor = "#F1F5F9"
+codeTextColor = "#0F172A"
+dataframeHeaderBackgroundColor = "#F1F5F9"
+dataframeBorderColor = "#E2E8F0"
+showSidebarBorder = false
+
+[theme.sidebar]
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#E2E8F0"
+primaryColor = "#60A5FA"
+borderColor = "#334155"
+linkColor = "#93C5FD"
+codeBackgroundColor = "#1E293B"
+codeTextColor = "#E2E8F0"
+
+[client]
+toolbarMode = "minimal"

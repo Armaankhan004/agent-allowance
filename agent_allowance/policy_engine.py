@@ -8,7 +8,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from .db import get_db_connection
 
 
@@ -531,3 +531,100 @@ def reject_pending(
         "status": "REJECTED",
         "reasons": existing_reasons,
     }
+
+
+# ==============================================================================
+# Rule Inspection & Mutation Helpers (Stored in SQLite, strictly validated)
+# ==============================================================================
+
+
+def validate_rule_value(
+    rule_type: str, condition_value: str
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate allowance rule values:
+    - Numeric rules (max_per_purchase, monthly_budget, approval_threshold) must be positive Decimals (> $0.00).
+    - allowed_merchants must be a non-empty comma-separated list with at least one merchant.
+
+    Returns:
+        (is_valid: bool, error_message: Optional[str])
+    """
+    rt = (rule_type or "").strip().lower()
+    val = (condition_value or "").strip()
+
+    if not val:
+        return False, f"Rule '{rule_type}' condition value cannot be empty."
+
+    if rt in ("max_per_purchase", "monthly_budget", "approval_threshold"):
+        try:
+            dec_val = Decimal(val).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if dec_val.is_nan() or dec_val.is_infinite():
+                return False, f"Rule '{rule_type}' must be a finite number."
+            if dec_val <= Decimal("0.00"):
+                return False, f"Rule '{rule_type}' must be greater than $0.00 (got ${val})."
+            return True, None
+        except (InvalidOperation, ValueError, TypeError):
+            return False, f"Rule '{rule_type}' value '{val}' is not a valid decimal number."
+
+    elif rt == "allowed_merchants":
+        merchants = [m.strip() for m in val.split(",") if m.strip()]
+        if not merchants:
+            return False, "allowed_merchants must contain at least one valid merchant name."
+        return True, None
+
+    return True, None
+
+
+def get_policy_rules(db_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Retrieve all active policy rules from SQLite indexed by rule_type.
+    """
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, rule_name, description, rule_type, condition_value, action, is_active, created_at
+        FROM rules
+        WHERE is_active = 1
+        ORDER BY id ASC
+        """
+    )
+    rules_dict = {}
+    for row in cursor.fetchall():
+        rules_dict[row["rule_type"].strip().lower()] = dict(row)
+    conn.close()
+    return rules_dict
+
+
+def update_policy_rule(
+    rule_type: str, new_value: str, db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Validate and update an existing allowance rule in SQLite.
+    Rule changes apply to future decisions only.
+    """
+    is_valid, err_msg = validate_rule_value(rule_type, new_value)
+    if not is_valid:
+        raise ValueError(err_msg)
+
+    rt = rule_type.strip().lower()
+    clean_val = new_value.strip()
+
+    # Format numeric rules to 2 decimal places if applicable
+    if rt in ("max_per_purchase", "monthly_budget", "approval_threshold"):
+        clean_val = str(Decimal(clean_val).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE rules SET condition_value = ? WHERE rule_type = ?",
+        (clean_val, rt),
+    )
+    if cursor.rowcount == 0:
+        conn.close()
+        raise ValueError(f"No active rule found with rule_type '{rule_type}'.")
+
+    conn.commit()
+    conn.close()
+    return {"rule_type": rt, "new_value": clean_val}
+
