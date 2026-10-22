@@ -4,7 +4,7 @@ Uses SQLite for persistent storage of allowance policies, audit logs, and ledger
 """
 
 import sqlite3
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from .config import Config
 
 
@@ -150,6 +150,135 @@ def init_db(db_path: Optional[str] = None) -> None:
     conn.close()
 
 
+def reset_demo_transactions(db_path: Optional[str] = None) -> int:
+    """
+    Reset demo data by clearing the transactions ledger and audit_logs.
+    CRITICAL SECURITY & CONFIG GUARANTEE: Does NOT delete or alter the rules table.
+    Returns the number of deleted transaction rows.
+    """
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM transactions")
+    count = cursor.fetchone()[0]
+    cursor.execute("DELETE FROM transactions")
+    cursor.execute("DELETE FROM audit_logs")
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_all_transactions(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Retrieve all transactions from the ledger ordered newest first.
+    """
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, proposal_id, merchant, amount, currency, category, reason, status,
+               reasons, evaluation_reason, paypal_order_id, paypal_approval_url, paypal_capture_id,
+               created_at, updated_at
+        FROM transactions
+        ORDER BY id DESC
+        """
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_pending_transactions(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Retrieve all transactions with status 'NEEDS_APPROVAL' awaiting human review.
+    """
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, proposal_id, merchant, amount, currency, category, reason, status,
+               reasons, evaluation_reason, paypal_order_id, paypal_approval_url,
+               created_at, updated_at
+        FROM transactions
+        WHERE status = 'NEEDS_APPROVAL'
+        ORDER BY id DESC
+        """
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_dashboard_metrics(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Compute headline allowance metrics for dashboard display:
+      - approved_spend: Decimal amount approved in current month
+      - monthly_budget: Decimal total budget for current month
+      - budget_remaining: Decimal amount remaining before hitting limit
+      - budget_used_pct: float (0.0 to 1.0) fraction of budget used
+      - pending_count: int number of transactions in NEEDS_APPROVAL
+      - blocked_count: int number of transactions BLOCKED this month
+    """
+    from datetime import datetime, timezone
+    from decimal import Decimal, ROUND_HALF_UP
+
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+
+    # 1. Monthly budget from active rules
+    cursor.execute("SELECT condition_value FROM rules WHERE rule_type = 'monthly_budget' AND is_active = 1")
+    row = cursor.fetchone()
+    monthly_budget_val = row["condition_value"] if row else "200.00"
+    try:
+        monthly_budget = Decimal(str(monthly_budget_val)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except Exception:
+        monthly_budget = Decimal("200.00")
+
+    # 2. Approved spend this calendar month
+    target_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    cursor.execute(
+        """
+        SELECT amount FROM transactions
+        WHERE status = 'APPROVED'
+          AND (strftime('%Y-%m', created_at) = ? OR created_at LIKE ?)
+        """,
+        (target_month, f"{target_month}%"),
+    )
+    approved_spend = Decimal("0.00")
+    for r in cursor.fetchall():
+        approved_spend += Decimal(str(r["amount"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # 3. Budget remaining and percentage used
+    budget_remaining = max(Decimal("0.00"), monthly_budget - approved_spend)
+    budget_used_pct = float(min(1.0, float(approved_spend) / float(monthly_budget))) if monthly_budget > 0 else 0.0
+
+    # 4. Pending count awaiting approval
+    cursor.execute("SELECT COUNT(*) FROM transactions WHERE status = 'NEEDS_APPROVAL'")
+    pending_count = cursor.fetchone()[0]
+
+    # 5. Blocked count this month
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM transactions
+        WHERE status = 'BLOCKED'
+          AND (strftime('%Y-%m', created_at) = ? OR created_at LIKE ?)
+        """,
+        (target_month, f"{target_month}%"),
+    )
+    blocked_count = cursor.fetchone()[0]
+
+    conn.close()
+
+    return {
+        "approved_spend": approved_spend,
+        "monthly_budget": monthly_budget,
+        "budget_remaining": budget_remaining,
+        "budget_used_pct": budget_used_pct,
+        "pending_count": pending_count,
+        "blocked_count": blocked_count,
+    }
+
+
 if __name__ == "__main__":
     init_db()
     print("Database initialized successfully.")
+

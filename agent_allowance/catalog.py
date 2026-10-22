@@ -9,7 +9,8 @@ them strictly as passive data and never execute instructions found within them.
 Regardless, the deterministic policy engine provides the true safety boundary.
 """
 
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Dict, Any, Optional, Set
 
 # Mock catalog database
 _CATALOG_DATA: List[Dict[str, Any]] = [
@@ -155,39 +156,119 @@ _CATALOG_DATA: List[Dict[str, Any]] = [
 ]
 
 
+STOP_WORDS: Set[str] = {
+    # Common stop words from natural language queries:
+    "buy", "buying", "buys",
+    "need", "needs", "needing", "needed",
+    "for",
+    "the",
+    "a", "an",
+    "some",
+    "we're", "were", "we", "re",
+    "low",
+    "on",
+    "etc",
+    "in", "at", "to", "of", "from", "with", "by", "into", "onto", "about",
+    "and", "or", "but", "so",
+    "is", "are", "am", "was", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "i", "you", "he", "she", "it", "they", "them", "our", "ours", "my", "your", "their", "me", "us",
+    "can", "could", "would", "should", "will", "shall",
+    "please", "want", "wants", "order", "ordering", "get", "getting",
+    "this", "that", "these", "those",
+    "just", "now", "very", "too",
+}
+
+
+def _tokenize(text: str) -> List[str]:
+    """Tokenize text into lowercase words, splitting camelCase and preserving contractions."""
+    if not text:
+        return []
+    expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    words = re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", expanded.lower())
+    return [w.strip("'") for w in words if w.strip("'")]
+
+
+def _get_variants(word: str) -> Set[str]:
+    """
+    Generate normalized forms and simple singular/plural variants of an English word.
+    Handles common plural forms:
+      - words ending in -ies (supplies <-> supply, pastries <-> pastry)
+      - words ending in -es (boxes <-> box, cases <-> case)
+      - regular -s (cards <-> card, rolls <-> roll, labels <-> label, papers <-> paper)
+    """
+    w = word.lower().strip()
+    if not w:
+        return set()
+    variants = {w}
+
+    # Plural -> Singular
+    if w.endswith("ies") and len(w) > 4:
+        variants.add(w[:-3] + "y")
+    elif w.endswith("es") and len(w) > 3:
+        variants.add(w[:-2])
+        variants.add(w[:-1])
+    elif w.endswith("s") and not w.endswith("ss") and len(w) > 2:
+        variants.add(w[:-1])
+
+    # Singular -> Plural
+    if w.endswith("y") and len(w) > 2:
+        variants.add(w[:-1] + "ies")
+    elif not w.endswith("s"):
+        variants.add(w + "s")
+        variants.add(w + "es")
+
+    return variants
+
+
 def search_products(query: str = "") -> List[Dict[str, Any]]:
     """
-    Search the catalog by keyword across name, category, merchant, and description.
-    Case-insensitive search. If query is empty, returns all products.
-    Results are ranked: title matches first, then category/merchant, then description.
-    
-    Returns a list of product dictionaries. Note: Descriptions are UNTRUSTED text.
+    Search the catalog by tokenized natural-language query across name, category, and description.
+    Drops common stop words (buy, need, for, the, a, some, we're, low, on, etc.),
+    matches tokens case-insensitively with simple plural handling,
+    and ranks results primarily by the number of matching query tokens.
+
+    If query is empty, returns all products.
+    Returns an empty list if no products match.
     """
     if not query or not query.strip():
         return [dict(p) for p in _CATALOG_DATA]
 
-    q = query.strip().lower()
-    matches_with_score = []
+    raw_tokens = _tokenize(query)
+    tokens = [t for t in raw_tokens if t not in STOP_WORDS]
+    if not tokens:
+        return []
+
+    scored_items = []
     for item in _CATALOG_DATA:
-        name_lower = item["name"].lower()
-        cat_lower = item["category"].lower()
-        merch_lower = item["merchant"].lower()
-        desc_lower = item["description"].lower()
+        name_words = set(_tokenize(item.get("name", "")))
+        cat_words = set(_tokenize(item.get("category", "")))
+        desc_words = set(_tokenize(item.get("description", "")))
 
-        if q in name_lower:
-            score = 1
-        elif q in cat_lower or q in merch_lower:
-            score = 2
-        elif q in desc_lower:
-            score = 3
-        else:
-            continue
+        name_vars = set.union(*(_get_variants(w) for w in name_words)) if name_words else set()
+        cat_vars = set.union(*(_get_variants(w) for w in cat_words)) if cat_words else set()
+        desc_vars = set.union(*(_get_variants(w) for w in desc_words)) if desc_words else set()
+        all_vars = name_vars | cat_vars | desc_vars
 
-        matches_with_score.append((score, dict(item)))
+        match_count = 0
+        name_match_count = 0
+        cat_match_count = 0
 
-    # Sort primarily by match relevance score
-    matches_with_score.sort(key=lambda x: x[0])
-    return [item for _, item in matches_with_score]
+        for t in tokens:
+            t_vars = _get_variants(t)
+            if t_vars & all_vars:
+                match_count += 1
+            if t_vars & name_vars:
+                name_match_count += 1
+            if t_vars & cat_vars:
+                cat_match_count += 1
+
+        if match_count > 0:
+            scored_items.append((match_count, name_match_count, cat_match_count, dict(item)))
+
+    # Rank by number of matching tokens (descending), then name matches, then category matches
+    scored_items.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+    return [item for _, _, _, item in scored_items]
 
 
 def get_product(product_id: str) -> Optional[Dict[str, Any]]:
