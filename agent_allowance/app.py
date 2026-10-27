@@ -9,15 +9,19 @@ UI notes (presentation only; policy/agent/db/PayPal logic is untouched):
   - Custom budget bar replaces st.progress (blue -> amber > 75% -> red > 90%).
   - Live agent steps (Searching catalog, Proposing purchase, Checking policy) and a
     decision card with accurate outcome labels (green check only for real approvals).
-  - Approvals with toasts, Rules with inline validation, styled Ledger, Demo tools
+  - Approvals with toasts, Rules with inline validation, AG Grid Ledger, Demo tools
     with a confirmation dialog for reset.
 """
 
+import csv
+import io
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
 
 # Ensure project root is in sys.path
@@ -28,7 +32,8 @@ if str(BASE_DIR) not in sys.path:
 from agent_allowance.config import Config
 from agent_allowance.db import (
     init_db,
-    get_all_transactions,
+    get_ledger_rows,
+    parse_reasons,
     get_pending_transactions,
     reset_demo_transactions,
 )
@@ -57,7 +62,17 @@ from agent_allowance.ui_theme import (
     get_decision_body_html,
     get_empty_state_html,
     status_card_key,
+    get_aggrid_theme_params,
+    get_aggrid_custom_css,
+    STATUS_META,
 )
+
+# AG Grid is optional at runtime: if the component is missing or broken, the
+# Ledger falls back to st.dataframe instead of crashing the page.
+try:
+    from st_aggrid import AgGrid, JsCode, StAggridTheme
+except Exception:  # pragma: no cover - depends on the environment
+    AgGrid = JsCode = StAggridTheme = None
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "logo.svg"
 
@@ -126,17 +141,7 @@ def flush_toasts() -> None:
 
 def _parse_reasons(raw: Any) -> List[str]:
     """Parse a stored reasons value (JSON list or plain text) into a list of strings."""
-    if not raw:
-        return []
-    if isinstance(raw, list):
-        return [str(r) for r in raw]
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return [str(r) for r in parsed]
-        return [str(parsed)]
-    except (TypeError, ValueError):
-        return [str(raw)]
+    return parse_reasons(raw)
 
 
 def _tool_name(tc: Dict[str, Any]) -> str:
@@ -699,6 +704,260 @@ def render_rules_page():
 # PAGE 4: LEDGER
 # ==============================================================================
 
+_STATUS_LABELS = {k: v["label"] for k, v in STATUS_META.items()}
+_STATUS_CLASSES = {k: v["cls"] for k, v in STATUS_META.items()}
+
+
+def _approved_total(rows: List[Dict[str, Any]]) -> Decimal:
+    return sum((Decimal(r["amount"]) for r in rows if r["status"] == "APPROVED"), Decimal("0.00"))
+
+
+def _csv_safe(value: Any) -> str:
+    """Stringify for CSV and defuse spreadsheet formula injection."""
+    text = "" if value is None else str(value)
+    stripped = text.lstrip(" \t\r\n")
+    return "'" + text if stripped[:1] in ("=", "+", "-", "@") else text
+
+
+def _ledger_csv(rows: List[Dict[str, Any]]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "time_utc", "merchant", "category", "amount", "currency", "status",
+                     "reasons", "paypal_order_id"])
+    for r in rows:
+        reasons_safe = " | ".join(_csv_safe(reason) for reason in r.get("reasons", []))
+        writer.writerow([_csv_safe(v) for v in (
+            r["id"], r["timestamp"], r["merchant"], r["category"], r["amount"], r["currency"],
+            r["status"], reasons_safe, r["paypal_order_id"],
+        )])
+    return buf.getvalue().encode("utf-8")
+
+
+def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
+    """Community-only AG Grid options for the ledger."""
+    labels = json.dumps(_STATUS_LABELS)
+    classes = json.dumps(_STATUS_CLASSES)
+    status_label_js = f"(s) => ({labels})[s] || String(s || '').replace(/_/g, ' ')"
+
+    # Class-style renderers: the component is built on AG Grid React, which treats a
+    # plain function renderer as a React component (returning DOM nodes crashes it).
+    status_renderer = JsCode(f"""
+        class StatusRenderer {{
+            init(p) {{
+                this.eGui = document.createElement('span');
+                if (p.node.rowPinned) {{
+                    this.eGui.className = 'aa-total-label';
+                    this.eGui.textContent = 'Approved spend';
+                    return;
+                }}
+                this.eGui.className = 'aa-pill ' + (({classes})[p.value] || 'rejected');
+                this.eGui.textContent = ({status_label_js})(p.value);
+            }}
+            getGui() {{ return this.eGui; }}
+            refresh() {{ return false; }}
+        }}
+    """)
+    reasons_renderer = JsCode("""
+        class ReasonsRenderer {
+            init(p) {
+                this.eGui = document.createElement('div');
+                if (p.node.rowPinned) return;
+                const reasons = (p.data && p.data.reasons_text) ? p.data.reasons_text.split('\\n') : [];
+                if (!reasons.length) {
+                    this.eGui.className = 'aa-muted';
+                    this.eGui.textContent = '\\u2014';
+                    return;
+                }
+                reasons.forEach(r => {
+                    const d = document.createElement('div');
+                    d.className = 'aa-r';
+                    d.textContent = r;
+                    this.eGui.appendChild(d);
+                });
+            }
+            getGui() { return this.eGui; }
+            refresh() { return false; }
+        }
+    """)
+    money_formatter = JsCode("""
+        function(p) {
+            if (p.value === null || p.value === undefined || p.value === '') return '';
+            try {
+                return new Intl.NumberFormat('en-US', {style: 'currency', currency: (p.data && p.data.currency) || 'USD'}).format(p.value);
+            } catch (e) {
+                return Number(p.value).toFixed(2) + ' ' + ((p.data && p.data.currency) || '');
+            }
+        }
+    """)
+    # Recompute the pinned total from the rows that pass the current filters.
+    update_total = JsCode("""
+        function(e) {
+            let cents = 0, count = 0;
+            const currencies = new Set();
+            e.api.forEachNodeAfterFilter(n => {
+                if (!n.data) return;
+                count += 1;
+                if (n.data.status === 'APPROVED') {
+                    cents += Math.round(Number(n.data.amount_value) * 100);
+                    currencies.add(n.data.currency);
+                }
+            });
+            const mixed = currencies.size > 1;
+            e.api.setGridOption('pinnedBottomRowData', [{
+                '::auto_unique_id::': 'aa-total',
+                id: null,
+                timestamp: count + (count === 1 ? ' row' : ' rows'),
+                merchant: mixed ? 'Mixed currencies' : '',
+                amount_value: mixed ? null : cents / 100,
+                currency: currencies.size === 1 ? [...currencies][0] : 'USD',
+                status: '', reasons_text: '', paypal_order_id: ''
+            }]);
+        }
+    """)
+
+    return {
+        "columnDefs": [
+            {"field": "id", "headerName": "ID", "width": 72, "cellDataType": "number", "filter": "agNumberColumnFilter",
+             "valueFormatter": JsCode("function(p){ return p.value == null ? 'Total' : '#' + p.value; }"),
+             "cellClass": "aa-muted"},
+            # Explicit "text": v34 otherwise infers dateTimeString and blanks the pinned "N rows" cell.
+            {"field": "timestamp", "headerName": "Time (UTC)", "width": 120, "cellDataType": "text",
+             "filter": "agTextColumnFilter", "wrapText": True, "autoHeight": True},
+            {"field": "merchant", "headerName": "Merchant", "flex": 1, "minWidth": 140, "cellDataType": "text",
+             "filter": "agTextColumnFilter", "cellClass": "aa-merchant", "tooltipField": "category",
+             "wrapText": True, "autoHeight": True},
+            {"field": "amount_value", "headerName": "Amount", "width": 108, "type": "rightAligned", "cellDataType": "number",
+             "filter": "agNumberColumnFilter", "valueFormatter": money_formatter, "cellClass": "aa-amount"},
+            {"field": "status", "headerName": "Status", "width": 160, "cellDataType": "text", "filter": "agTextColumnFilter",
+             "cellRenderer": status_renderer,
+             "filterValueGetter": JsCode(f"function(p){{ return ({status_label_js})(p.data.status); }}"),
+             "getQuickFilterText": JsCode(f"function(p){{ return ({status_label_js})(p.value); }}")},
+            {"field": "reasons_text", "headerName": "Reasons", "flex": 2, "minWidth": 210, "cellDataType": "text",
+             "filter": "agTextColumnFilter", "cellRenderer": reasons_renderer, "cellClass": "aa-reasons-cell",
+             "wrapText": True, "autoHeight": True, "tooltipField": "reasons_text"},
+            {"field": "paypal_order_id", "headerName": "PayPal order", "width": 160, "cellDataType": "text",
+             "filter": "agTextColumnFilter", "cellClass": "aa-mono", "tooltipField": "paypal_order_id"},
+        ],
+        "defaultColDef": {"sortable": True, "resizable": True, "filter": True, "suppressHeaderMenuButton": False},
+        # No custom getRowId: the component maps returned rows by its own ::auto_unique_id::.
+        "rowSelection": {"mode": "singleRow", "checkboxes": False, "enableClickSelection": True},
+        "pagination": True,
+        "paginationPageSize": 10,
+        "paginationPageSizeSelector": [10, 25, 50],
+        "domLayout": "autoHeight",
+        "tooltipShowDelay": 300,
+        "quickFilterText": quick_filter,
+        "overlayNoRowsTemplate": "No transactions match the current filters.",
+        "onFirstDataRendered": update_total,
+        "onFilterChanged": update_total,
+        "onRowDataUpdated": update_total,
+    }
+
+
+def _render_ledger_grid(rows: List[Dict[str, Any]], quick_filter: str) -> Optional[Any]:
+    """Render the AG Grid ledger. Returns the grid response, or raises on failure."""
+    df = pd.DataFrame([{
+        "id": r["id"],
+        "timestamp": r["timestamp"],
+        "merchant": r["merchant"],
+        "category": r["category"],
+        "amount_value": float(r["amount"]),  # display/sort only; totals use Decimal strings
+        "currency": r["currency"],
+        "status": r["status"],
+        "reasons_text": "\n".join(r["reasons"]),
+        "paypal_order_id": r["paypal_order_id"],
+    } for r in rows])
+    theme = (
+        StAggridTheme(base="quartz")
+        .withParams(**get_aggrid_theme_params())
+        .withParts("colorSchemeLight", "iconSetQuartzLight")
+    )
+    return AgGrid(
+        df,
+        gridOptions=_ledger_grid_options(quick_filter),
+        height=None,
+        theme=theme,
+        custom_css=get_aggrid_custom_css(),
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=False,
+        update_on=["selectionChanged", "filterChanged", "sortChanged"],
+        show_toolbar=False,
+        key="aa_ledger_grid",
+    )
+
+
+def _render_ledger_fallback(
+    rows: List[Dict[str, Any]], quick_filter: str, notice: str
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Basic st.dataframe ledger. Returns (rows shown, selected row id)."""
+    st.caption(md_escape(notice))
+    q = quick_filter.lower()
+    if q:
+        rows = [r for r in rows if q in " ".join([
+            str(r["id"]), r["merchant"], r["category"], r["status"], _STATUS_LABELS.get(r["status"], ""),
+            " ".join(r["reasons"]), r["paypal_order_id"],
+        ]).lower()]
+    event = st.dataframe(
+        [{
+            "ID": r["id"], "Time (UTC)": r["timestamp"], "Merchant": r["merchant"],
+            "Amount": f"{r['amount']} {r['currency']}", "Status": _STATUS_LABELS.get(r["status"], r["status"]),
+            "Reasons": " | ".join(r["reasons"]), "PayPal order": r["paypal_order_id"],
+        } for r in rows],
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key="aa_ledger_fallback",
+    )
+    st.caption(md_escape(
+        f"{len(rows)} rows · Approved spend ${_approved_total(rows):,.2f} · Select a row to read every reason."
+    ))
+    picked = event.selection.rows if event is not None else []
+    return rows, (rows[picked[0]]["id"] if picked and picked[0] < len(rows) else None)
+
+
+def _render_ledger_detail(row: Dict[str, Any]) -> None:
+    """Detail card for the selected ledger row (all text HTML-escaped and $-safe)."""
+    proposal = row.get("proposal") or {}
+    reasons_html = "".join(f"<li>{html_text(r)}</li>" for r in row["reasons"]) or \
+        '<li class="aa-muted">No reasons recorded.</li>'
+    order = row.get("paypal_order_id")
+    order_html = f'<span class="aa-mono">{html_text(order)}</span>' if order else '<span class="aa-muted">None</span>'
+    item = proposal.get("item_title") or proposal.get("item_id") or ""
+    agent_reason = row.get("agent_reason") or proposal.get("reason") or ""
+    with st.container(border=True, key=f"aa-card-static-ledger-{status_card_key(row['status'])}"):
+        render_html(f"""
+            <div class="aa-card-head">
+                <div class="aa-card-title">#{row['id']} · {html_text(row['merchant'])}</div>
+                {get_status_pill_html(row['status'])}
+            </div>
+            <div class="aa-kv">
+                <div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(row['amount'], row['currency'])}</div></div>
+                <div><div class="aa-label">Category</div><div class="aa-v">{html_text(row['category'])}</div></div>
+                <div><div class="aa-label">Time (UTC)</div><div class="aa-v">{html_text(row['timestamp'])}</div></div>
+            </div>
+            <div class="aa-kv">
+                <div><div class="aa-label">Proposal ID</div><div class="aa-v aa-mono">{html_text(row.get('proposal_id'))}</div></div>
+                {f'<div><div class="aa-label">Item</div><div class="aa-v">{html_text(item)}</div></div>' if item else ''}
+                <div><div class="aa-label">PayPal order</div><div class="aa-v">{order_html}</div></div>
+            </div>
+            {f'<div class="aa-label">Agent&#39;s reason</div><p class="aa-reason">{html_text(agent_reason)}</p>' if agent_reason else ''}
+            <div class="aa-label">Policy reasons</div>
+            <ul class="aa-reasons">{reasons_html}</ul>
+        """)
+
+
+def _selected_ledger_id(grid: Any) -> Optional[int]:
+    try:
+        selected = grid.selected_rows if grid is not None else None
+    except Exception:
+        return None
+    if selected is None or len(selected) == 0 or "id" not in selected.columns:
+        return None
+    value = selected.iloc[0]["id"]
+    return int(value) if pd.notna(value) else None
+
+
 def render_ledger_page():
     """Render audit ledger of all transactions."""
     with st.container(key="aa-page-ledger"):
@@ -707,8 +966,8 @@ def render_ledger_page():
             "Audit record of every proposal, policy decision and PayPal sandbox order.",
         )
 
-        transactions = get_all_transactions()
-        if not transactions:
+        rows = get_ledger_rows()
+        if not rows:
             render_html(get_empty_state_html(
                 "No transactions yet",
                 "Ask the agent to buy something and every decision will be recorded here.",
@@ -716,58 +975,48 @@ def render_ledger_page():
             ))
             return
 
-        statuses = ["All"] + sorted({(t.get("status") or "").upper() for t in transactions if t.get("status")})
-        labels = {s: ("All" if s == "All" else s.replace("_", " ").title()) for s in statuses}
-        f1, f2 = st.columns([3, 2], vertical_alignment="bottom")
+        f1, f2 = st.columns([4, 1], vertical_alignment="bottom")
         with f1:
-            choice = st.segmented_control(
-                "Status", statuses, default="All", format_func=lambda s: labels[s], key="aa_ledger_status"
-            ) or "All"
+            query = st.text_input(
+                "Search", placeholder="Search merchant, status, reason or order ID", key="aa_ledger_q",
+                icon=":material/search:",
+            )
+        quick_filter = (query or "").strip()
+
+        grid = None
+        fallback_id: Optional[int] = None
+        export_rows = rows
+        if AgGrid is None:
+            export_rows, fallback_id = _render_ledger_fallback(
+                rows, quick_filter, "Interactive grid unavailable (streamlit-aggrid not installed). Showing a basic table.")
+        else:
+            try:
+                grid = _render_ledger_grid(rows, quick_filter)
+            except Exception:
+                grid = None
+                export_rows, fallback_id = _render_ledger_fallback(
+                    rows, quick_filter, "Interactive grid failed to load. Showing a basic table.")
+
+        # Export what the grid currently shows (filters + sort).
+        try:
+            shown = grid.data if grid is not None else None
+            if shown is not None and "id" in shown.columns:
+                by_id = {r["id"]: r for r in rows}
+                export_rows = [by_id[int(i)] for i in shown["id"].dropna() if int(i) in by_id]
+        except Exception:
+            pass
         with f2:
-            query = st.text_input("Search", placeholder="Merchant, category or reason", key="aa_ledger_q")
-
-        q = (query or "").strip().lower()
-        rows_html: List[str] = []
-        shown = 0
-        for t in transactions:
-            status = (t.get("status") or "").upper()
-            if choice != "All" and status != choice:
-                continue
-            reasons = _parse_reasons(t.get("reasons")) or (
-                [t["evaluation_reason"]] if t.get("evaluation_reason") else []
-            )
-            haystack = " ".join([str(t.get("merchant", "")), str(t.get("category", "")), " ".join(reasons)]).lower()
-            if q and q not in haystack:
-                continue
-            shown += 1
-            reason_html = "<br>".join(html_text(r) for r in reasons) or '<span class="aa-muted">&mdash;</span>'
-            order = t.get("paypal_order_id")
-            order_html = f'<span class="aa-mono">{html_text(order)}</span>' if order else '<span class="aa-muted">&mdash;</span>'
-            rows_html.append(
-                f"<tr>"
-                f'<td class="aa-nowrap aa-muted">#{t["id"]}</td>'
-                f'<td class="aa-nowrap">{html_text(t.get("created_at"))}</td>'
-                f'<td><div class="aa-merchant">{html_text(t.get("merchant"))}</div>'
-                f'<div class="aa-cat">{html_text(t.get("category"))}</div></td>'
-                f'<td class="aa-amount">{money_html(t.get("amount"), t.get("currency"))}</td>'
-                f"<td>{get_status_pill_html(status)}</td>"
-                f'<td class="aa-reason-cell">{reason_html}</td>'
-                f"<td>{order_html}</td>"
-                f"</tr>"
+            st.download_button(
+                "Export CSV", data=_ledger_csv(export_rows), file_name="agent_allowance_ledger.csv",
+                mime="text/csv", icon=":material/download:", width="stretch", key="aa_ledger_export",
             )
 
-        if not rows_html:
-            render_html(get_empty_state_html("No matches", "Try a different status or search term.",
-                                             icon='<span class="aa-msym">search_off</span>'))
-            return
-
-        render_html(
-            '<div class="aa-table-wrap"><table class="aa-table"><thead><tr>'
-            '<th>ID</th><th>Time (UTC)</th><th>Merchant</th><th class="aa-amount">Amount</th>'
-            "<th>Status</th><th>Decision reason</th><th>PayPal order</th>"
-            "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table></div>"
-        )
-        st.caption(f"Showing {shown} of {len(transactions)} transactions.")
+        selected_id = _selected_ledger_id(grid) if grid is not None else fallback_id
+        selected = next((r for r in rows if r["id"] == selected_id), None)
+        if selected:
+            _render_ledger_detail(selected)
+        elif grid is not None:
+            st.caption("Select a row to see the full proposal, every policy reason and the PayPal order.")
 
 
 # ==============================================================================

@@ -341,31 +341,6 @@ header[data-testid="stHeader"] { background: transparent; }
 .aa-field-hint  { color: var(--aa-pending-fg); font-size: 0.8rem; margin: -0.2rem 0 0.6rem 0; }
 .aa-dirty { color: var(--aa-pending-fg); font-size: 0.85rem; font-weight: 600; }
 
-/* ---------- Ledger table ---------- */
-.aa-table-wrap {
-    background: var(--aa-surface); border: 1px solid var(--aa-border); border-radius: var(--aa-radius-card);
-    box-shadow: var(--aa-shadow-sm); overflow: auto; max-height: 640px;
-}
-table.aa-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.86rem; margin: 0; }
-table.aa-table th {
-    position: sticky; top: 0; z-index: 1; background: var(--aa-surface-muted); text-align: left;
-    font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
-    color: var(--aa-text-muted); padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--aa-border);
-    white-space: nowrap;
-}
-table.aa-table td {
-    padding: 0.75rem 0.9rem; border-bottom: 1px solid var(--aa-border); vertical-align: top;
-    color: var(--aa-text-soft); border-left: none; border-right: none;
-}
-table.aa-table tr:last-child td { border-bottom: none; }
-table.aa-table tbody tr { transition: background-color var(--aa-t-fast) ease; }
-table.aa-table tbody tr:hover { background: var(--aa-surface-muted); }
-table.aa-table td.aa-nowrap { white-space: nowrap; }
-table.aa-table td.aa-amount { white-space: nowrap; font-weight: 600; color: var(--aa-text); text-align: right; }
-table.aa-table th.aa-amount { text-align: right; }
-table.aa-table td.aa-reason-cell { min-width: 280px; max-width: 460px; line-height: 1.45; overflow-wrap: anywhere; }
-table.aa-table td .aa-merchant { font-weight: 600; color: var(--aa-text); }
-table.aa-table td .aa-cat { color: var(--aa-text-muted); font-size: 0.78rem; }
 
 /* ---------- Inputs (main area) ---------- */
 .stApp [data-baseweb="input"], .stApp [data-baseweb="base-input"], .stApp [data-baseweb="textarea"],
@@ -854,3 +829,66 @@ def get_empty_state_html(title: str, body: str, icon: str = "&#10003;") -> str:
             <p>{html_text(body)}</p>
         </div>
     """
+
+
+# ==============================================================================
+# AG Grid (Ledger) theme
+# ==============================================================================
+# The grid renders inside the component's iframe, so the page CSS above does not
+# reach it. These helpers feed the same TOKENS to AG Grid's theming params and to
+# the component's `custom_css` (injected into the iframe).
+
+def get_aggrid_theme_params() -> Dict[str, Any]:
+    """AG Grid (v34 Quartz) theme params matching the light app theme."""
+    t = TOKENS
+    return {
+        "fontFamily": [{"googleFont": "Inter"}, "system-ui", "sans-serif"],
+        "fontSize": 13,
+        "headerFontSize": 11,
+        "headerFontWeight": 600,
+        "backgroundColor": t["surface"],
+        "foregroundColor": t["text-soft"],
+        "headerTextColor": t["text-muted"],
+        "headerBackgroundColor": t["surface-muted"],
+        "chromeBackgroundColor": t["surface-muted"],
+        "borderColor": t["border"],
+        "accentColor": t["primary"],
+        "rowHoverColor": t["surface-muted"],
+        "selectedRowBackgroundColor": t["primary-soft"],
+        "wrapperBorderRadius": 12,
+        "borderRadius": 8,
+        "columnBorder": False,
+        "spacing": 7,
+    }
+
+
+def get_aggrid_custom_css() -> Dict[str, Dict[str, str]]:
+    """Iframe CSS for status pills, wrapped reasons and the pinned total row."""
+    t = TOKENS
+    css: Dict[str, Dict[str, str]] = {
+        ".ag-header-cell-text": {"text-transform": "uppercase", "letter-spacing": "0.05em"},
+        ".aa-pill": {
+            "display": "inline-flex", "align-items": "center", "gap": "6px", "white-space": "nowrap",
+            "padding": "2px 10px", "border-radius": t["radius-pill"], "font-size": "11.5px",
+            "font-weight": "600", "letter-spacing": "0.02em", "line-height": "1.5",
+        },
+        ".aa-pill::before": {
+            "content": '""', "width": "6px", "height": "6px", "border-radius": "50%", "background": "currentColor",
+        },
+        ".aa-merchant": {"font-weight": "600", "color": t["text"]},
+        ".aa-amount": {"font-weight": "600", "color": t["text"], "font-variant-numeric": "tabular-nums"},
+        ".aa-mono": {"font-family": "ui-monospace, SFMono-Regular, Menlo, monospace", "font-size": "11.5px"},
+        ".aa-muted": {"color": t["placeholder"]},
+        # Wrapped cells otherwise inherit the full row height as line-height.
+        ".ag-cell-wrap-text": {"line-height": "1.45", "padding-top": "10px", "padding-bottom": "10px",
+                               "word-break": "normal"},
+        ".aa-reasons-cell .aa-r": {"white-space": "normal", "overflow-wrap": "anywhere"},
+        ".aa-reasons-cell .aa-r + .aa-r": {"margin-top": "4px"},
+        ".ag-row-pinned": {"font-weight": "700", "color": t["text"], "background": t["surface-muted"]},
+        ".aa-total-label": {"font-size": "11px", "font-weight": "600", "text-transform": "uppercase",
+                            "letter-spacing": "0.05em", "color": t["text-muted"]},
+    }
+    for meta in STATUS_META.values():
+        cls = meta["cls"]
+        css[f".aa-pill.{cls}"] = {"color": t[f"{cls}-fg"], "background": t[f"{cls}-bg"]}
+    return css
