@@ -3,7 +3,9 @@ Database setup and schema for Agent Allowance.
 Uses SQLite for persistent storage of allowance policies, audit logs, and ledger transactions.
 """
 
+import json
 import sqlite3
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any
 from .config import Config
 
@@ -183,6 +185,74 @@ def get_all_transactions(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
         """
     )
     rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def parse_reasons(raw: Any) -> List[str]:
+    """Parse a stored reasons value (JSON list or plain text) into a list of strings."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(r) for r in raw]
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return [str(raw)]
+    if isinstance(parsed, list):
+        return [str(r) for r in parsed]
+    return [str(parsed)] if parsed not in (None, "") else []
+
+
+def _parse_proposal(raw: Any) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def get_ledger_rows(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Ledger rows as plain dicts for display, newest first.
+
+    `amount` is a 2-decimal string built via Decimal (display only; no float math).
+    `reasons` is always a list, falling back to the semicolon summary for legacy rows.
+    `proposal` is the stored proposal JSON parsed into a dict ({} if missing/invalid).
+    """
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, proposal_id, created_at, merchant, amount, currency, category, reason,
+               status, reasons, evaluation_reason, raw_proposal, paypal_order_id
+        FROM transactions
+        ORDER BY id DESC
+        """
+    )
+    rows = []
+    for r in cursor.fetchall():
+        reasons = parse_reasons(r["reasons"])
+        if not reasons and r["evaluation_reason"]:
+            reasons = [s.strip() for s in r["evaluation_reason"].split(";") if s.strip()]
+        try:
+            amount = str(Decimal(str(r["amount"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        except (InvalidOperation, ValueError):
+            amount = "0.00"
+        rows.append({
+            "id": r["id"],
+            "proposal_id": r["proposal_id"],
+            "timestamp": r["created_at"],
+            "merchant": r["merchant"],
+            "amount": amount,
+            "currency": r["currency"] or "USD",
+            "category": r["category"],
+            "status": (r["status"] or "").upper(),
+            "reasons": reasons,
+            "agent_reason": r["reason"] or "",
+            "proposal": _parse_proposal(r["raw_proposal"]),
+            "paypal_order_id": r["paypal_order_id"] or "",
+        })
     conn.close()
     return rows
 
