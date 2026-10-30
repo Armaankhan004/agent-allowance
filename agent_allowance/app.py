@@ -36,6 +36,7 @@ from agent_allowance.db import (
     parse_reasons,
     get_pending_transactions,
     reset_demo_transactions,
+    get_transaction_by_order_id,
 )
 from agent_allowance.policy_engine import (
     approve_pending,
@@ -44,7 +45,8 @@ from agent_allowance.policy_engine import (
     update_policy_rule,
     validate_rule_value,
 )
-from agent_allowance.agent import ShoppingAgent, create_order_for_approved
+from agent_allowance.agent import ShoppingAgent, create_order_for_approved, capture_if_approved
+from agent_allowance.paypal_client import get_order_status
 from agent_allowance.ui_theme import (
     inject_theme_css,
     get_status_pill_html,
@@ -709,7 +711,7 @@ _STATUS_CLASSES = {k: v["cls"] for k, v in STATUS_META.items()}
 
 
 def _approved_total(rows: List[Dict[str, Any]]) -> Decimal:
-    return sum((Decimal(r["amount"]) for r in rows if r["status"] == "APPROVED"), Decimal("0.00"))
+    return sum((Decimal(r["amount"]) for r in rows if r["status"] in ("APPROVED", "EXECUTED")), Decimal("0.00"))
 
 
 def _csv_safe(value: Any) -> str:
@@ -797,7 +799,7 @@ def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
             e.api.forEachNodeAfterFilter(n => {
                 if (!n.data) return;
                 count += 1;
-                if (n.data.status === 'APPROVED') {
+                if (n.data.status === 'APPROVED' || n.data.status === 'EXECUTED') {
                     cents += Math.round(Number(n.data.amount_value) * 100);
                     currencies.add(n.data.currency);
                 }
@@ -923,6 +925,8 @@ def _render_ledger_detail(row: Dict[str, Any]) -> None:
         '<li class="aa-muted">No reasons recorded.</li>'
     order = row.get("paypal_order_id")
     order_html = f'<span class="aa-mono">{html_text(order)}</span>' if order else '<span class="aa-muted">None</span>'
+    capture = row.get("paypal_capture_id")
+    capture_html = f'<span class="aa-mono">{html_text(capture)}</span>' if capture else '<span class="aa-muted">None</span>'
     item = proposal.get("item_title") or proposal.get("item_id") or ""
     agent_reason = row.get("agent_reason") or proposal.get("reason") or ""
     with st.container(border=True, key=f"aa-card-static-ledger-{status_card_key(row['status'])}"):
@@ -938,8 +942,8 @@ def _render_ledger_detail(row: Dict[str, Any]) -> None:
             </div>
             <div class="aa-kv">
                 <div><div class="aa-label">Proposal ID</div><div class="aa-v aa-mono">{html_text(row.get('proposal_id'))}</div></div>
-                {f'<div><div class="aa-label">Item</div><div class="aa-v">{html_text(item)}</div></div>' if item else ''}
                 <div><div class="aa-label">PayPal order</div><div class="aa-v">{order_html}</div></div>
+                {f'<div><div class="aa-label">Capture ID</div><div class="aa-v">{capture_html}</div></div>' if capture else (f'<div><div class="aa-label">Item</div><div class="aa-v">{html_text(item)}</div></div>' if item else '')}
             </div>
             {f'<div class="aa-label">Agent&#39;s reason</div><p class="aa-reason">{html_text(agent_reason)}</p>' if agent_reason else ''}
             <div class="aa-label">Policy reasons</div>
@@ -1020,6 +1024,214 @@ def render_ledger_page():
 
 
 # ==============================================================================
+# Payment Return Handling (PayPal Checkout Return & Cancel)
+# ==============================================================================
+
+def process_payment_return(params: Dict[str, Any], db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Process PayPal payment return parameters (return or cancel).
+    - Checks ledger by paypal_order_id.
+    - Ignores unknown tokens.
+    - Never trusts query params for amounts or status.
+    - Checks order status with PayPal Orders v2 GET /v2/checkout/orders/{id}.
+    - If PayPal status is APPROVED and ledger is APPROVED, captures via capture_if_approved.
+    - If already captured (EXECUTED), returns idempotent COMPLETED.
+    - If cancel, reports cancellation and leaves ledger untouched.
+    """
+    action = params.get("paypal")
+    if isinstance(action, list):
+        action = action[0] if action else ""
+    action = str(action or "").lower().strip()
+
+    token = params.get("token")
+    if isinstance(token, list):
+        token = token[0] if token else ""
+    token = str(token or "").strip()
+
+    if action == "cancel":
+        return {
+            "status": "cancelled",
+            "message": "Payment was cancelled. Your allowance and ledger remain unchanged.",
+            "token": token,
+        }
+
+    if action == "return":
+        if not token:
+            return {"status": "ignored", "reason": "missing_token"}
+
+        row = get_transaction_by_order_id(token, db_path=db_path)
+        if not row:
+            return {"status": "ignored", "reason": "unknown_token"}
+
+        ledger_status = (row.get("status") or "").upper()
+        if ledger_status in ("BLOCKED", "NEEDS_APPROVAL", "REJECTED"):
+            return {
+                "status": "forbidden",
+                "ledger_status": ledger_status,
+                "row": row,
+                "message": f"Payment cannot be captured: transaction #{row['id']} has policy status '{ledger_status}'.",
+            }
+
+        if ledger_status == "EXECUTED":
+            return {
+                "status": "COMPLETED",
+                "already_captured": True,
+                "capture_id": row.get("paypal_capture_id"),
+                "order_id": token,
+                "row": row,
+                "message": f"Payment already captured (Capture ID: {row.get('paypal_capture_id')}).",
+            }
+
+        if ledger_status == "APPROVED":
+            try:
+                order_data = get_order_status(token)
+                paypal_status = (order_data.get("status") if isinstance(order_data, dict) else str(order_data) or "").upper()
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "order_id": token,
+                    "row": row,
+                    "message": f"Failed to retrieve PayPal order status: {e}",
+                }
+
+            if paypal_status == "APPROVED":
+                try:
+                    capture_res = capture_if_approved(row["id"], db_path=db_path)
+                    return {
+                        "status": "COMPLETED",
+                        "capture_id": capture_res.get("paypal_capture_id") or capture_res.get("capture_id"),
+                        "order_id": token,
+                        "row": row,
+                        "message": "Payment successfully captured and verified with PayPal Sandbox.",
+                    }
+                except Exception as e:
+                    return {
+                        "status": "error",
+                        "order_id": token,
+                        "row": row,
+                        "message": f"Capture failed: {e}",
+                    }
+            else:
+                return {
+                    "status": "not_approved",
+                    "paypal_status": paypal_status or "PENDING",
+                    "order_id": token,
+                    "row": row,
+                    "message": f"Order is not yet approved in PayPal (status: {paypal_status or 'PENDING'}).",
+                }
+
+    return {"status": "ignored", "reason": "unknown_action"}
+
+
+def render_payment_return_panel(db_path: Optional[str] = None) -> None:
+    """Display payment return banner when returning from PayPal checkout or cancellation."""
+    try:
+        qp = dict(st.query_params)
+    except Exception:
+        return
+    if "paypal" not in qp:
+        return
+
+    res = process_payment_return(qp, db_path=db_path)
+    status = res.get("status")
+    if status == "ignored":
+        return
+
+    with st.container():
+        if status == "cancelled":
+            render_html("""
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid #94A3B8; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.25rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <div style="font-weight:700; font-size:1rem; color:var(--aa-text);">Payment was cancelled</div>
+                            <div style="font-size:0.88rem; color:var(--aa-text-muted); margin-top:0.25rem;">The PayPal checkout session was cancelled. Your monthly budget, allowance, and ledger remain completely unchanged.</div>
+                        </div>
+                    </div>
+                </div>
+            """)
+            if st.button("Dismiss notice", key="aa_dismiss_cancel"):
+                st.query_params.clear()
+                st.rerun()
+
+        elif status == "COMPLETED":
+            row = res.get("row") or {}
+            capture_id = res.get("capture_id") or ""
+            order_id = res.get("order_id") or ""
+            render_html(f"""
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-approved-fg); border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                        <div style="font-weight:700; font-size:1.05rem; color:var(--aa-text);">Payment Return · COMPLETED</div>
+                        <span class="aa-pill executed">COMPLETED</span>
+                    </div>
+                    <div style="font-size:0.88rem; color:var(--aa-text-soft); line-height:1.5;">
+                        Transaction <strong>#{row.get('id', '')}</strong> ({html_text(row.get('merchant', ''))}) for <strong>{money_html(row.get('amount', '0.00'), row.get('currency', 'USD'))}</strong> has been successfully captured in PayPal Sandbox.
+                    </div>
+                    <div style="display:flex; gap:1.5rem; margin-top:0.6rem; font-size:0.82rem; color:var(--aa-text-muted);">
+                        <div>Order ID: <span class="aa-mono">{html_text(order_id)}</span></div>
+                        <div>Capture ID: <span class="aa-mono">{html_text(capture_id)}</span></div>
+                    </div>
+                </div>
+            """)
+            if st.button("Dismiss", key="aa_dismiss_completed"):
+                st.query_params.clear()
+                st.rerun()
+
+        elif status == "not_approved":
+            row = res.get("row") or {}
+            paypal_status = res.get("paypal_status", "PENDING")
+            order_id = res.get("order_id", "")
+            render_html(f"""
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid #F59E0B; border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                        <div style="font-weight:700; font-size:1.05rem; color:var(--aa-text);">Payment Return · Awaiting Buyer Approval</div>
+                        <span class="aa-pill pending">{html_text(paypal_status)}</span>
+                    </div>
+                    <div style="font-size:0.88rem; color:var(--aa-text-soft); line-height:1.5;">
+                        PayPal indicates that order <span class="aa-mono">{html_text(order_id)}</span> has not been approved by the buyer yet (current PayPal status: <strong>{html_text(paypal_status)}</strong>).
+                    </div>
+                </div>
+            """)
+            c1, c2 = st.columns([1.5, 5])
+            with c1:
+                if st.button("Check again", key="aa_check_again"):
+                    st.rerun()
+            with c2:
+                if st.button("Dismiss", key="aa_dismiss_not_approved"):
+                    st.query_params.clear()
+                    st.rerun()
+
+        elif status == "forbidden":
+            row = res.get("row") or {}
+            msg = res.get("message", "")
+            render_html(f"""
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-blocked-fg); border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                        <div style="font-weight:700; font-size:1.05rem; color:var(--aa-text);">Payment Return · Capture Refused</div>
+                        <span class="aa-pill blocked">{html_text(row.get('status', 'BLOCKED'))}</span>
+                    </div>
+                    <div style="font-size:0.88rem; color:var(--aa-text-soft);">
+                        {html_text(msg)} This transaction cannot be captured.
+                    </div>
+                </div>
+            """)
+            if st.button("Dismiss", key="aa_dismiss_forbidden"):
+                st.query_params.clear()
+                st.rerun()
+
+        elif status == "error":
+            msg = res.get("message", "An error occurred while processing the payment return.")
+            render_html(f"""
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-blocked-fg); border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                    <div style="font-weight:700; font-size:1rem; color:var(--aa-text);">Payment Return Error</div>
+                    <div style="font-size:0.88rem; color:var(--aa-text-soft); margin-top:0.25rem;">{html_text(msg)}</div>
+                </div>
+            """)
+            if st.button("Dismiss", key="aa_dismiss_error"):
+                st.query_params.clear()
+                st.rerun()
+
+
+# ==============================================================================
 # Main Application Router
 # ==============================================================================
 
@@ -1052,6 +1264,9 @@ def main():
     metrics_slot = st.empty()
     with metrics_slot.container():
         render_metrics_banner()
+
+    # Render payment return banner if returning from PayPal
+    render_payment_return_panel()
 
     # Persistent sidebar demo tools
     render_sidebar_demo_tools()

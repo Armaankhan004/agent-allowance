@@ -224,6 +224,7 @@ header[data-testid="stHeader"] { background: transparent; }
 [class*="st-key-aa-card-static"]:hover { transform: none; box-shadow: var(--aa-shadow-sm); }
 [class*="st-key-aa-card-decision-approved"], [class*="st-key-aa-card-pending"] { border-left-width: 4px !important; }
 [class*="st-key-aa-card-decision-approved"] { border-left: 4px solid var(--aa-approved-fg) !important; }
+[class*="st-key-aa-card-decision-executed"] { border-left: 4px solid var(--aa-executed-fg) !important; }
 [class*="st-key-aa-card-decision-pending"]  { border-left: 4px solid #F59E0B !important; }
 [class*="st-key-aa-card-decision-blocked"]  { border-left: 4px solid var(--aa-blocked-fg) !important; }
 [class*="st-key-aa-card-decision-none"]     { border-left: 4px solid #94A3B8 !important; }
@@ -778,6 +779,7 @@ def status_card_key(status: str) -> str:
     """Map a decision status to the decision card key suffix (controls the left border color)."""
     return {
         "APPROVED": "approved",
+        "EXECUTED": "executed",
         "NEEDS_APPROVAL": "pending",
         "BLOCKED": "blocked",
     }.get((status or "").upper(), "none")

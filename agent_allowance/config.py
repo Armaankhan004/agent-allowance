@@ -35,6 +35,7 @@ class Config:
     )
     DEFAULT_CURRENCY: str = os.getenv("DEFAULT_CURRENCY", "USD")
     APP_ENV: str = os.getenv("APP_ENV", "development")
+    APP_BASE_URL: str = os.getenv("APP_BASE_URL", "http://localhost:8501").rstrip("/")
 
     @classmethod
     def validate_paypal_config(cls) -> bool:

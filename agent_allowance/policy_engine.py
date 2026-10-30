@@ -54,7 +54,7 @@ def get_monthly_approved_spend(
     cursor.execute(
         """
         SELECT amount FROM transactions
-        WHERE status = 'APPROVED'
+        WHERE status IN ('APPROVED', 'EXECUTED')
           AND strftime('%Y-%m', created_at) = ?
         """,
         (target_month,),

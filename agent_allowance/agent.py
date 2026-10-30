@@ -182,6 +182,17 @@ def capture_if_approved(
         conn.close()
         raise ValueError(f"Ledger record with ID {ledger_id} not found.")
 
+    if row["status"] == "EXECUTED":
+        conn.close()
+        return {
+            "ledger_id": ledger_id,
+            "paypal_order_id": row["paypal_order_id"],
+            "capture_id": row["paypal_capture_id"],
+            "paypal_capture_id": row["paypal_capture_id"],
+            "status": "COMPLETED",
+            "already_captured": True,
+        }
+
     if row["status"] != "APPROVED":
         conn.close()
         raise ValueError(
@@ -229,7 +240,8 @@ def capture_if_approved(
         "ledger_id": ledger_id,
         "paypal_order_id": order_id,
         "capture_id": capture_id,
-        "status": status or "EXECUTED",
+        "paypal_capture_id": capture_id,
+        "status": status or "COMPLETED",
     }
 
 
