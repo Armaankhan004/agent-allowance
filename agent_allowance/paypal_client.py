@@ -128,6 +128,8 @@ class PayPalSandboxClient:
         amount: float,
         currency: str = "USD",
         description: str = "Agent Allowance Purchase",
+        return_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
     ) -> PayPalOrderResult:
         """
         Create a new PayPal order using the Orders v2 API.
@@ -136,6 +138,8 @@ class PayPalSandboxClient:
             amount: Amount to charge (e.g., 5.00)
             currency: Three-letter ISO-4217 currency code (default: 'USD')
             description: Narrative description for the purchase unit
+            return_url: URL to return to after approval (default: APP_BASE_URL?paypal=return)
+            cancel_url: URL to return to after cancel (default: APP_BASE_URL?paypal=cancel)
 
         Returns:
             PayPalOrderResult: NamedTuple with (order_id, approval_url)
@@ -153,6 +157,11 @@ class PayPalSandboxClient:
             "Authorization": f"Bearer {access_token}",
             "PayPal-Request-Id": request_id,
         }
+
+        # Resolve return and cancel URLs
+        base_app_url = (getattr(Config, "APP_BASE_URL", None) or os.getenv("APP_BASE_URL", "http://localhost:8501")).rstrip("/")
+        effective_return_url = return_url or f"{base_app_url}?paypal=return"
+        effective_cancel_url = cancel_url or f"{base_app_url}?paypal=cancel"
 
         # Format amount to two decimal places
         formatted_amount = f"{amount:.2f}"
@@ -177,8 +186,8 @@ class PayPalSandboxClient:
                         "locale": "en-US",
                         "landing_page": "LOGIN",
                         "user_action": "PAY_NOW",
-                        "return_url": "https://example.com/return",
-                        "cancel_url": "https://example.com/cancel",
+                        "return_url": effective_return_url,
+                        "cancel_url": effective_cancel_url,
                     }
                 }
             },
@@ -302,6 +311,12 @@ class PayPalSandboxClient:
 
         return response.json()
 
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        """
+        Query GET /v2/checkout/orders/{id} to retrieve current order details and status.
+        """
+        return self.get_order(order_id)
+
     @staticmethod
     def _sanitize_error(response: requests.Response) -> str:
         """Extract readable error message without leaking headers or secrets."""
@@ -340,12 +355,20 @@ def create_order(
     amount: float,
     currency: str = "USD",
     description: str = "Agent Allowance Purchase",
+    return_url: Optional[str] = None,
+    cancel_url: Optional[str] = None,
 ) -> PayPalOrderResult:
     """
     Convenience function to create a sandbox order and return (order_id, approval_url).
     """
     client = get_paypal_client()
-    return client.create_order(amount=amount, currency=currency, description=description)
+    return client.create_order(
+        amount=amount,
+        currency=currency,
+        description=description,
+        return_url=return_url,
+        cancel_url=cancel_url,
+    )
 
 
 def capture_order(order_id: str) -> Dict[str, Any]:
@@ -354,3 +377,12 @@ def capture_order(order_id: str) -> Dict[str, Any]:
     """
     client = get_paypal_client()
     return client.capture_order(order_id=order_id)
+
+
+def get_order_status(order_id: str) -> Dict[str, Any]:
+    """
+    Convenience function to fetch order status from PayPal Orders v2 (GET /v2/checkout/orders/{id}).
+    """
+    client = get_paypal_client()
+    return client.get_order_status(order_id=order_id)
+

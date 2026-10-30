@@ -114,6 +114,32 @@ Open `http://localhost:8501` in your browser.
 
 ---
 
+### 💳 Approving a PayPal Sandbox Payment & The Return Loop
+
+Agent Allowance implements a full closed-loop payment authorization and capture workflow:
+
+1. **Policy Approval & Order Creation**:
+   - The agent proposes a purchase (e.g. via Chat or CLI).
+   - The deterministic policy engine evaluates limits. If within budget, it marks the transaction **APPROVED** and creates a PayPal Orders v2 Sandbox order with `return_url` set to `${APP_BASE_URL}?paypal=return` and `cancel_url` set to `${APP_BASE_URL}?paypal=cancel`.
+
+2. **Buyer Approval in PayPal Sandbox**:
+   - Click the **"Review & Pay with PayPal"** button on the decision card.
+   - Log in using your **Personal Sandbox Buyer account** credentials (from [developer.paypal.com/dashboard/accounts](https://developer.paypal.com/dashboard/accounts)).
+   - Click **"Complete Purchase"** or **"Pay Now"**.
+
+3. **Return & Capture Verification**:
+   - PayPal redirects back to `http://localhost:8501/?paypal=return&token=<ORDER_ID>`.
+   - The app verifies the token against the SQLite ledger (ignoring untrusted query params for amounts or status).
+   - Calls PayPal Orders v2 (`GET /v2/checkout/orders/{id}`) via `get_order_status` to ensure PayPal confirmed the buyer's approval.
+   - Executes `capture_if_approved` to capture the payment, transition the ledger status to **`EXECUTED`**, and display the `paypal_capture_id` alongside a **`COMPLETED`** badge.
+   - The capture is completely **idempotent**: attempting to capture an already executed transaction will safely display the existing capture details without calling PayPal again.
+
+4. **Cancellation**:
+   - If the user clicks "Cancel and return to Agent Allowance" on PayPal, PayPal redirects to `?paypal=cancel`.
+   - The dashboard presents a neutral cancellation notice and leaves the ledger and monthly budget unchanged.
+
+---
+
 ## 🧪 Running Tests
 
 Run the test suite with pytest:

@@ -225,7 +225,7 @@ def get_ledger_rows(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     cursor.execute(
         """
         SELECT id, proposal_id, created_at, merchant, amount, currency, category, reason,
-               status, reasons, evaluation_reason, raw_proposal, paypal_order_id
+               status, reasons, evaluation_reason, raw_proposal, paypal_order_id, paypal_capture_id
         FROM transactions
         ORDER BY id DESC
         """
@@ -252,9 +252,35 @@ def get_ledger_rows(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
             "agent_reason": r["reason"] or "",
             "proposal": _parse_proposal(r["raw_proposal"]),
             "paypal_order_id": r["paypal_order_id"] or "",
+            "paypal_capture_id": r["paypal_capture_id"] or "",
         })
     conn.close()
     return rows
+
+
+def get_transaction_by_order_id(order_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve a single transaction record by its paypal_order_id."""
+    if not order_id:
+        return None
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, proposal_id, created_at, merchant, amount, currency, category, reason,
+               status, reasons, evaluation_reason, raw_proposal, paypal_order_id,
+               paypal_approval_url, paypal_capture_id
+        FROM transactions
+        WHERE paypal_order_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (order_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return dict(row)
 
 
 def get_pending_transactions(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -308,7 +334,7 @@ def get_dashboard_metrics(db_path: Optional[str] = None) -> Dict[str, Any]:
     cursor.execute(
         """
         SELECT amount FROM transactions
-        WHERE status = 'APPROVED'
+        WHERE status IN ('APPROVED', 'EXECUTED')
           AND (strftime('%Y-%m', created_at) = ? OR created_at LIKE ?)
         """,
         (target_month, f"{target_month}%"),

@@ -37,3 +37,6 @@ codeTextColor = "#E2E8F0"
 
 [client]
 toolbarMode = "minimal"
+
+[server]
+runOnSave = true
