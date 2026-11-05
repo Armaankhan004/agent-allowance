@@ -324,9 +324,10 @@ def test_gemini_api_error_returns_clear_error_and_never_leaks_key(mock_genai_cli
 @patch("agent_allowance.agent.genai.Client")
 def test_gemini_max_iteration_limit(mock_genai_client_cls, test_db):
     """
-    Verify the tool loop enforces a max-iteration limit (6) so the agent cannot loop indefinitely.
+    Verify the tool loop enforces a max-iteration limit so the agent cannot loop indefinitely.
     """
     from google.genai import types
+    from agent_allowance.agent import MAX_TOOL_ITERATIONS
 
     fc = types.FunctionCall(name="search_products", args={"query": "paper"})
     cand = types.Candidate(content=types.Content(role="model", parts=[types.Part(function_call=fc)]))
@@ -339,8 +340,10 @@ def test_gemini_max_iteration_limit(mock_genai_client_cls, test_db):
     agent = ShoppingAgent(provider="gemini", api_key="dummy-key", db_path=test_db)
     result = agent.run("Need infinite paper")
 
-    # Should hit exactly 6 iterations and exit gracefully
-    assert mock_client_instance.models.generate_content.call_count == 6
-    assert len(result["tool_calls"]) == 6
-    assert "Completed 6 iterations" in result["thought"]
+    # Should hit exactly MAX_TOOL_ITERATIONS iterations and exit gracefully
+    assert MAX_TOOL_ITERATIONS == 4
+    assert mock_client_instance.models.generate_content.call_count == MAX_TOOL_ITERATIONS
+    assert len(result["tool_calls"]) == MAX_TOOL_ITERATIONS
+    assert result["llm_requests"] == MAX_TOOL_ITERATIONS
+    assert f"Completed {MAX_TOOL_ITERATIONS} iterations" in result["thought"]
 
