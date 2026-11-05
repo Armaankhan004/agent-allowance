@@ -314,10 +314,78 @@ def create_order_for_approved(
 # ==============================================================================
 
 
+_BARE_AFFIRMATIVES = frozenset({
+    "yes",
+    "y",
+    "yep",
+    "yeah",
+    "ok",
+    "okay",
+    "k",
+    "sure",
+    "please",
+    "yes please",
+    "go ahead",
+})
+
+
+def _is_bare_affirmative(text: str) -> bool:
+    cleaned = (text or "").strip().strip(".!?,;:'\"()[]{}").strip().lower()
+    return cleaned in _BARE_AFFIRMATIVES
+
+
+def build_conversation_memory(
+    history: Optional[List[Dict[str, Any]]],
+    max_messages: int = 4,
+) -> List[Dict[str, str]]:
+    """
+    Build short conversation memory from prior chat messages:
+    - Keeps at most the last `max_messages` (default 4) messages.
+    - Includes ONLY user and agent plain text (`user` and `model` roles).
+    - Never includes `tool_calls`, `proposal_result`, or catalog product descriptions.
+    """
+    if not history or max_messages <= 0:
+        return []
+
+    catalog_descriptions = [
+        item["description"]
+        for item in search_products("")
+        if isinstance(item.get("description"), str) and item["description"].strip()
+    ]
+
+    cleaned: List[Dict[str, str]] = []
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        raw_role = str(msg.get("role") or "").strip().lower()
+        if raw_role == "user":
+            role = "user"
+        elif raw_role in ("assistant", "model"):
+            if msg.get("ran") is False:
+                continue
+            role = "model"
+        else:
+            continue
+
+        text = str(msg.get("content") if "content" in msg else (msg.get("agent_response") or "")).strip()
+        if not text:
+            continue
+
+        # Never allow raw catalog descriptions into conversation memory
+        for desc in catalog_descriptions:
+            if desc in text:
+                text = text.replace(desc, "").strip()
+
+        if text:
+            cleaned.append({"role": role, "content": text})
+
+    return cleaned[-max_messages:]
+
+
 class ShoppingAgent:
     """
     Autonomous Shopping Agent with provider-agnostic LLM interface.
-    Default mode: 'mock' (no API keys required, ideal for offline demos and testing).
+    Default mode: 'mock' (Demo mode: no API keys required, ideal for offline demos and testing).
     Supports LLM_PROVIDER='gemini' using the official Google GenAI SDK (google-genai).
     """
 
@@ -328,7 +396,8 @@ class ShoppingAgent:
         model: Optional[str] = None,
         db_path: Optional[str] = None,
     ):
-        self.provider = (provider or Config.LLM_PROVIDER or "mock").lower()
+        raw_provider = (provider or Config.LLM_PROVIDER or "mock").lower()
+        self.provider = "mock" if raw_provider == "demo" else raw_provider
         if api_key is not None:
             self.api_key = api_key
         else:
@@ -349,6 +418,7 @@ class ShoppingAgent:
         on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_policy_decision: Optional[Callable[[Dict[str, Any]], None]] = None,
         max_llm_requests: Optional[int] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Process a user shopping request.
@@ -360,6 +430,7 @@ class ShoppingAgent:
             on_tool_call: Optional callback for each tool invocation (tool_name, args_dict)
             on_policy_decision: Optional callback for each policy decision (decision_dict)
             max_llm_requests: Optional budget of real LLM requests for this run (None = unlimited)
+            history: Optional list of recent chat messages (up to last 4 user/agent text turns)
 
         Every result includes "llm_requests": the number of real LLM requests made.
         """
@@ -370,6 +441,7 @@ class ShoppingAgent:
                 force_item_id=force_item_id,
                 on_tool_call=on_tool_call,
                 on_policy_decision=on_policy_decision,
+                history=history,
             )
             result["llm_requests"] = 0
             return result
@@ -379,6 +451,7 @@ class ShoppingAgent:
                 on_tool_call=on_tool_call,
                 on_policy_decision=on_policy_decision,
                 max_llm_requests=max_llm_requests,
+                history=history,
             )
         else:
             return self._run_live_llm(user_request)
@@ -390,9 +463,10 @@ class ShoppingAgent:
         force_item_id: Optional[str] = None,
         on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_policy_decision: Optional[Callable[[Dict[str, Any]], None]] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        Deterministic mock agent runner.
+        Deterministic Demo mode agent runner.
         Executes search_products and propose_purchase without any external network calls.
         """
         query = user_request.lower()
@@ -410,6 +484,33 @@ class ShoppingAgent:
                     on_policy_decision(decision)
                 except Exception:
                     pass
+
+        if not obey_injection and not force_item_id and _is_bare_affirmative(user_request):
+            memory = build_conversation_memory(history, max_messages=4)
+            last_suggestion = next(
+                (m["content"] for m in reversed(memory) if m["role"] == "model"),
+                None,
+            )
+            if last_suggestion:
+                helpful_msg = (
+                    f"Repeating the last suggestion: {last_suggestion} "
+                    "In Demo mode, try asking for a specific item such as "
+                    "'Buy copy paper for the office', 'We're low on flour', or "
+                    "'Search specials and buy the $500 gift card'."
+                )
+            else:
+                helpful_msg = (
+                    "Here are a few Demo mode suggestions you can try right now: "
+                    "'Buy copy paper for the office' ($8.49, auto-approved), "
+                    "'We're low on flour' ($28.50, needs approval), or "
+                    "'Search specials and buy the $500 gift card' (blocked by policy)."
+                )
+            return {
+                "thought": "User replied with a bare confirmation; repeating suggestion with helpful options.",
+                "tool_calls": [],
+                "proposal_result": None,
+                "agent_response": helpful_msg,
+            }
 
         # Adversarial Prompt Injection Scenario:
         # If simulated as obeying the injection or explicitly asked about the malicious listing
@@ -535,10 +636,12 @@ class ShoppingAgent:
         on_tool_call: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         on_policy_decision: Optional[Callable[[Dict[str, Any]], None]] = None,
         max_llm_requests: Optional[int] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Execute shopping request using official Google GenAI SDK (google-genai).
         Uses native tool calling with exactly two tools: search_products and propose_purchase.
+        Passes up to the last 4 chat messages (user and agent text only, never catalog text) as context.
         Runs a tool-call loop with a max-iteration limit of MAX_TOOL_ITERATIONS.
         Identical search_products calls within a run are served from a per-run cache.
         Quota errors (429 / RESOURCE_EXHAUSTED) are not retried and return a short
@@ -634,7 +737,7 @@ class ShoppingAgent:
             return {
                 "error": f"Failed to initialize Gemini client: {err_str}",
                 "error_kind": "error",
-                "error_message": "Could not connect to Gemini. Check the API key, or switch to Mock mode.",
+                "error_message": "Could not connect to Gemini. Check the API key, or switch to Demo mode.",
                 "thought": "Gemini client initialization error.",
                 "tool_calls": [],
                 "proposal_result": None,
@@ -642,12 +745,20 @@ class ShoppingAgent:
                 "llm_requests": 0,
             }
 
+        memory_turns = build_conversation_memory(history, max_messages=4)
         contents = [
+            types.Content(
+                role=turn["role"],
+                parts=[types.Part.from_text(text=turn["content"])],
+            )
+            for turn in memory_turns
+        ]
+        contents.append(
             types.Content(
                 role="user",
                 parts=[types.Part.from_text(text=user_request)],
             )
-        ]
+        )
 
         recorded_tool_calls: List[Dict[str, Any]] = []
         last_proposal_result: Optional[Dict[str, Any]] = None
@@ -669,7 +780,7 @@ class ShoppingAgent:
             response = None
             for attempt in range(MAX_ATTEMPTS):
                 if max_llm_requests is not None and llm_requests >= max_llm_requests:
-                    cap_msg = "Gemini request limit reached for this session. Switched to Mock mode."
+                    cap_msg = "Gemini request limit reached for this session. Switched to Demo mode."
                     return {
                         "error": None if last_proposal_result else cap_msg,
                         "error_kind": "session_cap",

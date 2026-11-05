@@ -15,7 +15,7 @@ MODES = (MODE_MOCK, MODE_GEMINI)
 
 _USED_KEY = "aa_llm_requests_used"
 
-GENERIC_ERROR = "Something went wrong. Please try again, or switch to Mock mode."
+GENERIC_ERROR = "Something went wrong. Please try again, or switch to Demo mode."
 
 
 # ==============================================================================
@@ -136,9 +136,9 @@ def parse_llm_error(err: Any) -> Dict[str, Any]:
     else:
         message = "Gemini is rate-limited right now."
     if retry is not None:
-        message += f" Try again in about {_format_wait(retry)}, or switch to Mock mode."
+        message += f" Try again in about {_format_wait(retry)}, or switch to Demo mode."
     else:
-        message += " Try again later, or switch to Mock mode."
+        message += " Try again later, or switch to Demo mode."
     return {"kind": "quota", "message": message, "retry_after_seconds": retry}
 
 

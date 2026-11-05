@@ -336,7 +336,7 @@ def render_assistant_turn(msg: Dict[str, Any], key_suffix: str, is_primary: bool
         render_html(get_quota_notice_html(msg["error"]))
         if st.session_state.get("aa_mode") == MODE_GEMINI:
             st.button(
-                "Switch to Mock mode", key=f"aa_switch_mock_{key_suffix}",
+                "Switch to Demo mode", key=f"aa_switch_mock_{key_suffix}",
                 type="primary" if is_primary else "secondary",
                 icon=":material/swap_horiz:", on_click=switch_to_mock_mode,
             )
@@ -412,7 +412,8 @@ def confirm_reset_dialog() -> None:
                 st.rerun()
 
 
-MODE_LABELS = {MODE_MOCK: "Mock", MODE_GEMINI: "Gemini"}
+MODE_LABELS = {MODE_MOCK: "Demo mode", MODE_GEMINI: "Gemini"}
+MODE_EXPLANATION = "Demo mode uses a scripted agent so demos are reliable. Gemini mode runs the real model."
 
 
 def switch_to_mock_mode() -> None:
@@ -424,13 +425,13 @@ def gemini_caps_caption(cap: int) -> str:
     """Sidebar caption for Gemini mode: the app's per-session cap plus Google's daily quota."""
     noun = "request" if cap == 1 else "requests"
     return (f"Up to {cap} Gemini {noun} per session. Gemini's own daily quota also applies; "
-            "when either runs out, Mock mode keeps working.")
+            "when either runs out, Demo mode keeps working.")
 
 
 def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
     """
-    Sidebar Mock/Gemini toggle with the per-session Gemini request meter.
-    Returns (active mode, pill note). Once the cap is spent the session is pinned to Mock.
+    Sidebar Demo mode / Gemini toggle with the per-session Gemini request meter.
+    Returns (active mode, pill note). Once the cap is spent the session is pinned to Demo mode.
     """
     state = st.session_state
     cap = Config.LLM_SESSION_CAP
@@ -448,17 +449,18 @@ def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
             "Agent mode", MODES, key="aa_mode", format_func=MODE_LABELS.get, horizontal=True,
             label_visibility="collapsed", disabled=capped or not has_key,
         )
+        st.caption(MODE_EXPLANATION)
         if not has_key:
-            st.caption("Gemini needs LLM_API_KEY. Mock mode runs offline with no limits.")
+            st.caption("Gemini needs LLM_API_KEY. Demo mode runs offline with no limits.")
         elif capped:
             render_html(
                 '<div class="aa-side-note"><b>Gemini limit reached.</b> This session used all '
-                f'{cap} Gemini requests, so the agent now runs in Mock mode.</div>'
+                f'{cap} Gemini requests, so the agent now runs in Demo mode.</div>'
             )
         else:
             render_html(get_side_meter_html(remaining, cap))
             if state["aa_mode"] == MODE_MOCK:
-                st.caption("Mock mode is unlimited.")
+                st.caption("Demo mode is unlimited.")
             else:
                 st.caption(gemini_caps_caption(cap))
         st.divider()
@@ -559,6 +561,11 @@ def render_chat_page():
             return
 
     with page:
+        prior_history = [
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in st.session_state["messages"]
+            if m.get("role") == "user" or m.get("ran")
+        ][-4:]
         st.session_state["messages"].append({"role": "user", "content": user_input})
         with st.chat_message("user", avatar=USER_AVATAR):
             render_user_bubble(user_input)
@@ -604,6 +611,7 @@ def render_chat_page():
                     on_tool_call=on_tool_callback,
                     on_policy_decision=on_policy_callback,
                     max_llm_requests=budget,
+                    history=prior_history,
                 )
             except Exception as e:
                 result = {"error": str(e), "tool_calls": live_tool_calls, "proposal_result": None}
