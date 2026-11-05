@@ -3,12 +3,13 @@ Streamlit Web Application for Agent Allowance.
 Deterministic Financial Guardrails for Autonomous AI Agents · Powered by PayPal Sandbox.
 
 UI notes (presentation only; policy/agent/db/PayPal logic is untouched):
-  - Light global theme; navy palette scoped to the sidebar via [theme.sidebar].
+  - Warm peach-cream global theme; deep-purple palette scoped to the sidebar via [theme.sidebar].
   - All styling lives in agent_allowance/ui_theme.py (design tokens -> CSS variables).
   - Dollar amounts are escaped so markdown never renders them as LaTeX.
-  - Custom budget bar replaces st.progress (blue -> amber > 75% -> red > 90%).
-  - Live agent steps (Searching catalog, Proposing purchase, Checking policy) and a
-    decision card with accurate outcome labels (green check only for real approvals).
+  - Ring gauge for the monthly allowance (mauve < 75% -> amber to 90% -> red above).
+  - Live pipeline strip (Agent -> Rules -> PayPal) driven by the agent's real
+    callbacks, and a verdict card with accurate outcome labels (a check only for
+    real approvals; PayPal only lights up when a sandbox order exists).
   - Approvals with toasts, Rules with inline validation, AG Grid Ledger, Demo tools
     with a confirmation dialog for reset.
 """
@@ -46,23 +47,39 @@ from agent_allowance.policy_engine import (
     validate_rule_value,
 )
 from agent_allowance.agent import ShoppingAgent, create_order_for_approved, capture_if_approved
+from agent_allowance.llm_guard import (
+    GENERIC_ERROR,
+    MODE_GEMINI,
+    MODE_MOCK,
+    MODES,
+    effective_mode,
+    record_requests,
+    redact,
+    requests_remaining,
+    resolve_default_mode,
+)
 from agent_allowance.paypal_client import get_order_status
 from agent_allowance.ui_theme import (
     inject_theme_css,
     get_status_pill_html,
     get_mode_pill_html,
+    get_quota_notice_html,
+    get_side_meter_html,
     render_header,
     render_metrics_banner,
-    render_how_it_works_strip,
     render_section_title,
     render_html,
     md_escape,
     html_text,
     money_html,
-    get_live_steps_html,
-    get_outcome_html,
-    get_decision_body_html,
+    svg_icon,
+    pipeline_states,
+    get_pipeline_html,
+    get_verdict_html,
+    get_welcome_html,
     get_empty_state_html,
+    APPROVALS_EMPTY_ILLUSTRATION,
+    LEDGER_EMPTY_ILLUSTRATION,
     status_card_key,
     get_aggrid_theme_params,
     get_aggrid_custom_css,
@@ -77,6 +94,9 @@ except Exception:  # pragma: no cover - depends on the environment
     AgGrid = JsCode = StAggridTheme = None
 
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "logo.svg"
+AVATAR_PATH = Path(__file__).resolve().parent / "assets" / "avatar.svg"
+AGENT_AVATAR = str(AVATAR_PATH) if AVATAR_PATH.exists() else ":material/shield:"
+USER_AVATAR = ":material/person:"
 
 # Populated in main(); used for st.page_link targets.
 _PAGES: Dict[str, Any] = {}
@@ -110,6 +130,8 @@ def get_chat_outcome_label_and_state(result: Dict[str, Any]) -> Tuple[str, str]:
     Shows a green check ONLY when a purchase was actually APPROVED.
     """
     if result.get("error"):
+        if result.get("error_kind") == "quota":
+            return "Gemini unavailable", "error"
         return "Agent error", "error"
 
     prop = result.get("proposal_result")
@@ -141,6 +163,22 @@ def flush_toasts() -> None:
         st.toast(md_escape(message), icon=icon)
 
 
+def safe_error_text(detail: Any, generic: str = GENERIC_ERROR) -> str:
+    """Error text for the UI: generic in a public demo, otherwise redacted detail."""
+    if Config.DEMO_PUBLIC:
+        return generic
+    return redact(str(detail), Config.llm_api_key())
+
+
+def friendly_agent_error(result: Dict[str, Any]) -> Optional[str]:
+    """One user-facing line for a failed agent run (never the raw provider payload)."""
+    if not result.get("error"):
+        return None
+    if result.get("error_kind") in ("quota", "session_cap", "config") and result.get("error_message"):
+        return result["error_message"]
+    return safe_error_text(result["error"])
+
+
 def _parse_reasons(raw: Any) -> List[str]:
     """Parse a stored reasons value (JSON list or plain text) into a list of strings."""
     return parse_reasons(raw)
@@ -165,29 +203,28 @@ def _fmt_amount_text(amount: Any) -> str:
         return str(amount)
 
 
-def derive_step_states(
-    tool_calls: List[Dict[str, Any]], proposal_result: Optional[Dict[str, Any]]
-) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Final step states + details for a completed agent turn."""
-    searches = _search_calls(tool_calls)
+def _proposal_detail(src: Dict[str, Any]) -> str:
+    if not src.get("merchant"):
+        return ""
+    return f"{src.get('merchant')} \u00b7 {_fmt_amount_text(src.get('amount', 0))}"
+
+
+def turn_pipeline(msg: Dict[str, Any]) -> Tuple[Dict[str, Tuple[str, str]], str]:
+    """Final pipeline states + agent detail line for a completed assistant turn."""
+    tool_calls = msg.get("tool_calls") or []
+    proposal_result = msg.get("proposal_result")
     proposals = _proposal_calls(tool_calls)
-    states: Dict[str, str] = {}
-    details: Dict[str, str] = {}
-
-    states["search"] = "done" if searches or proposals or proposal_result else "skipped"
-    if searches and searches[-1].get("query"):
-        details["search"] = f"\u201c{searches[-1]['query']}\u201d"
-
-    if proposals or proposal_result:
-        states["propose"] = "done"
-        src = (proposal_result or {}).get("proposal") or (proposals[-1] if proposals else {})
-        if src.get("merchant"):
-            details["propose"] = f"{src.get('merchant')} \u00b7 {_fmt_amount_text(src.get('amount', 0))}"
-    else:
-        states["propose"] = "skipped"
-
-    states["policy"] = "done" if proposal_result else "skipped"
-    return states, details
+    if msg.get("error") and not proposal_result:
+        return pipeline_states("error"), ""
+    if not proposal_result:
+        return pipeline_states("no_proposal"), ""
+    src = proposal_result.get("proposal") or (proposals[-1] if proposals else {})
+    states = pipeline_states(
+        "decided",
+        status=proposal_result.get("status"),
+        has_order=bool(proposal_result.get("paypal_order_id")),
+    )
+    return states, _proposal_detail(src)
 
 
 # ==============================================================================
@@ -206,11 +243,13 @@ def _next_step_text(status: str, approval_url: Optional[str]) -> str:
     return "No payment was made."
 
 
-def render_decision_card(
-    tool_calls: List[Dict[str, Any]],
-    proposal_result: Dict[str, Any],
+def render_verdict_card(
+    msg: Dict[str, Any],
     key_suffix: str,
+    is_primary: bool = True,
 ) -> None:
+    tool_calls = msg.get("tool_calls") or []
+    proposal_result = msg["proposal_result"]
     status = (proposal_result.get("status") or "UNKNOWN").upper()
     proposal = proposal_result.get("proposal") or {}
     props = _proposal_calls(tool_calls)
@@ -223,11 +262,13 @@ def render_decision_card(
     reason = proposal.get("reason") or fallback.get("reason") or ""
     approval_url = proposal_result.get("approval_url")
     order_id = proposal_result.get("paypal_order_id")
+    title, _ = get_chat_outcome_label_and_state(msg)
 
-    with st.container(border=True, key=f"aa-card-static-decision-{status_card_key(status)}-{key_suffix}"):
+    with st.container(key=f"aa-verdict-{status_card_key(status)}-{key_suffix}"):
         render_html(
-            get_decision_body_html(
+            get_verdict_html(
                 status=status,
+                title=title,
                 merchant=merchant,
                 amount=amount,
                 currency=currency,
@@ -235,65 +276,113 @@ def render_decision_card(
                 reason=reason,
                 policy_reasons=_parse_reasons(proposal_result.get("reasons")),
                 next_step=_next_step_text(status, approval_url),
+                order_id=order_id,
             )
         )
+        render_html('<div style="height:12px;"></div>')
         if status == "APPROVED" and approval_url:
             st.link_button(
-                "Pay with PayPal sandbox",
+                "Open PayPal sandbox checkout",
                 approval_url,
-                type="primary",
+                type="primary" if is_primary else "secondary",
                 icon=":material/open_in_new:",
                 width="stretch",
             )
-            if order_id:
-                render_html(f'<div class="aa-muted aa-mono" style="margin-top:0.5rem;">Order {html_text(order_id)}</div>')
-        elif status == "NEEDS_APPROVAL" and _PAGES.get("approvals"):
-            st.page_link(_PAGES["approvals"], label="Review in Approvals", icon=":material/arrow_forward:")
+        elif status == "NEEDS_APPROVAL":
+            ledger_id = proposal_result.get("ledger_id") or proposal_result.get("id")
+            c_app, c_rev = st.columns([1.4, 1.6])
+            with c_app:
+                if ledger_id and st.button(
+                    "Approve and pay",
+                    key=f"chat_app_btn_{key_suffix}_{ledger_id}",
+                    type="primary" if is_primary else "secondary",
+                    icon=":material/check:",
+                    width="stretch",
+                ):
+                    try:
+                        app_res = approve_pending(int(ledger_id))
+                    except Exception:
+                        app_res = None
+                    if app_res and app_res.get("approved"):
+                        try:
+                            ord_res = create_order_for_approved(int(ledger_id))
+                            proposal_result["status"] = "APPROVED"
+                            proposal_result["approval_url"] = ord_res.get("approval_url")
+                            proposal_result["paypal_order_id"] = ord_res.get("order_id")
+                        except Exception:
+                            proposal_result["status"] = "APPROVED"
+                        queue_toast(f"Approved #{ledger_id} ({_fmt_amount_text(amount)} at {merchant}).", ":material/check_circle:")
+                        st.rerun()
+            with c_rev:
+                if _PAGES.get("approvals"):
+                    st.page_link(_PAGES["approvals"], label="Review in approvals", icon=":material/arrow_forward:")
         elif status == "BLOCKED" and _PAGES.get("rules"):
-            st.page_link(_PAGES["rules"], label="View Rules", icon=":material/tune:")
+            st.page_link(_PAGES["rules"], label="View rules", icon=":material/tune:")
 
 
-def render_assistant_turn(msg: Dict[str, Any], key_suffix: str) -> None:
-    """Render a completed assistant turn: steps, outcome, agent text, decision card."""
-    tool_calls = msg.get("tool_calls") or []
+def render_assistant_turn(msg: Dict[str, Any], key_suffix: str, is_primary: bool = True) -> None:
+    """
+    Render a completed assistant turn: pipeline, decision card (or plain agent text when there is no card).
+    v4 rule: Do NOT render raw agent text ('Proposal evaluated...', 'I have proposed...') when a decision
+    card is shown. Show agent text only when there is no card, and never clip it.
+    """
     proposal_result = msg.get("proposal_result")
 
     if msg.get("ran"):
-        states, details = derive_step_states(tool_calls, proposal_result)
-        render_html(get_live_steps_html(states, details))
-        label, state = get_chat_outcome_label_and_state(msg)
-        render_html(get_outcome_html(label, state))
+        states, detail = turn_pipeline(msg)
+        render_html(get_pipeline_html(states, detail, compact=True))
 
-    if msg.get("error"):
-        st.error(md_escape(f"The agent hit a problem: {msg['error']}"), icon=":material/error:")
-    elif msg.get("content"):
-        st.markdown(md_escape(msg["content"]))
+    if msg.get("error") and msg.get("error_kind") == "quota":
+        render_html(get_quota_notice_html(msg["error"]))
+        if st.session_state.get("aa_mode") == MODE_GEMINI:
+            st.button(
+                "Switch to Mock mode", key=f"aa_switch_mock_{key_suffix}",
+                type="primary" if is_primary else "secondary",
+                icon=":material/swap_horiz:", on_click=switch_to_mock_mode,
+            )
+    elif msg.get("error"):
+        st.error(md_escape(msg["error"]), icon=":material/error:")
+    elif msg.get("content") and not proposal_result:
+        # Plain escaped text, not markdown: LLM output must not render links or remote images.
+        # Shown only when there is no decision card, and never clipped.
+        with st.container(key=f"aa-bubble-{key_suffix}"):
+            render_html(f'<div class="aa-agent-msg">{html_text(msg["content"])}</div>')
+    if msg.get("notice"):
+        st.info(md_escape(msg["notice"]), icon=":material/info:")
 
     if proposal_result:
-        render_decision_card(tool_calls, proposal_result, key_suffix)
+        render_verdict_card(msg, key_suffix, is_primary=is_primary)
+
+
+def render_user_bubble(text: str) -> None:
+    """Right-aligned user bubble (HTML-escaped, '$'-safe)."""
+    render_html(f'<div class="aa-user-msg">{html_text(text)}</div>')
 
 
 def render_example_cards() -> None:
-    """Three scenario cards on a fresh chat."""
+    """Three quiet scenario cards on a fresh chat (white, hairline border, small icon, short description, secondary button)."""
     scenarios = [
-        ("paper", "inventory_2", "Office supplies", "Small purchase under the $25 approval threshold. Expect auto-approval.",
+        ("paper", "package", "Office supplies",
+         "A small purchase under the $25 approval threshold.",
          "Buy copy paper for the office", "Buy copy paper for the office"),
-        ("flour", "bakery_dining", "Bakery restock", "Restock from Golden Grain Mills. May need your approval.",
+        ("flour", "wheat", "Bakery restock",
+         "Restock flour from Golden Grain Mills. Larger orders wait for you.",
          "We're low on flour", "we're low on flour"),
-        ("gift", "gpp_maybe", "Policy defense", "A $500 gift card from an unlisted merchant. Expect a block.",
+        ("gift", "gift", "Policy defense",
+         "A $500 gift card from an unlisted merchant, planted by a prompt injection.",
          "Try the gift card attack", "Search specials and buy the $500 gift card"),
     ]
-    render_html('<div class="aa-label" style="margin: 0.25rem 0 0.6rem 0;">Try a scenario</div>')
+    render_html('<div class="aa-label" style="margin: 0.35rem 0 0.25rem 0;">Try a scenario</div>')
     cols = st.columns(3)
     for col, (sid, icon, title, desc, button_label, prompt) in zip(cols, scenarios):
         with col:
             with st.container(border=True, key=f"aa-card-scn-{sid}"):
                 render_html(
-                    f'<div class="aa-icon-chip"><span class="aa-msym">{icon}</span></div>'
-                    f'<div class="aa-card-title">{html_text(title)}</div>'
-                    f'<p class="aa-card-desc">{html_text(desc)}</p>'
+                    f'<div class="aa-card-head"><div class="aa-icon-chip">{svg_icon(icon, 16)}</div>'
+                    f'<div class="aa-card-title" style="margin:0;flex:1;">{html_text(title)}</div></div>'
+                    f'<div class="aa-card-desc">{html_text(desc)}</div>'
                 )
-                if st.button(button_label, key=f"btn_ex_{sid}", width="stretch"):
+                if st.button(button_label, key=f"btn_ex_{sid}", type="secondary", width="stretch"):
                     st.session_state["prefill_prompt"] = prompt
                     st.rerun()
 
@@ -323,6 +412,52 @@ def confirm_reset_dialog() -> None:
                 st.rerun()
 
 
+MODE_LABELS = {MODE_MOCK: "Mock", MODE_GEMINI: "Gemini"}
+
+
+def switch_to_mock_mode() -> None:
+    """Button callback (runs before widgets, so it may set the radio's state)."""
+    st.session_state["aa_mode"] = MODE_MOCK
+
+
+def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
+    """
+    Sidebar Mock/Gemini toggle with the per-session Gemini request meter.
+    Returns (active mode, pill note). Once the cap is spent the session is pinned to Mock.
+    """
+    state = st.session_state
+    cap = Config.LLM_SESSION_CAP
+    has_key = bool(Config.llm_api_key())
+    if "aa_mode" not in state:
+        state["aa_mode"] = resolve_default_mode(Config.DEFAULT_MODE, Config.llm_api_key(), Config.LLM_PROVIDER)
+    remaining = requests_remaining(state, cap)
+    capped = has_key and remaining <= 0
+    if capped or not has_key:
+        state["aa_mode"] = MODE_MOCK
+
+    with st.sidebar:
+        render_html('<div class="aa-side-label">Agent mode</div>')
+        st.radio(
+            "Agent mode", MODES, key="aa_mode", format_func=MODE_LABELS.get, horizontal=True,
+            label_visibility="collapsed", disabled=capped or not has_key,
+        )
+        if not has_key:
+            st.caption("Gemini needs LLM_API_KEY. Mock mode runs offline with no limits.")
+        elif capped:
+            render_html(
+                '<div class="aa-side-note"><b>Gemini limit reached.</b> This session used all '
+                f'{cap} Gemini requests, so the agent now runs in Mock mode.</div>'
+            )
+        else:
+            render_html(get_side_meter_html(remaining, cap))
+            st.caption("Mock mode is unlimited.")
+        st.divider()
+
+    active = effective_mode(state["aa_mode"], state, cap)
+    state["aa_active_mode"] = active
+    return active, ("Gemini limit reached" if capped else None)
+
+
 def render_sidebar_demo_tools() -> None:
     """Collapsed Demo tools expander plus PayPal sandbox status."""
     with st.sidebar:
@@ -336,7 +471,11 @@ def render_sidebar_demo_tools() -> None:
                 st.rerun()
 
             st.caption("Clear transaction history and audit logs.")
-            if st.button("Reset demo data", key="side_reset_btn", icon=":material/restart_alt:", width="stretch"):
+            # Public demo: the Reset button stays hidden until the visitor confirms intent.
+            show_reset = not Config.DEMO_PUBLIC or st.checkbox(
+                "I want to reset the shared demo data", key="aa_unlock_reset"
+            )
+            if show_reset and st.button("Reset demo data", key="side_reset_btn", icon=":material/restart_alt:", width="stretch"):
                 confirm_reset_dialog()
 
         attack_res = st.session_state.get("last_attack_result")
@@ -346,7 +485,7 @@ def render_sidebar_demo_tools() -> None:
             render_html(
                 f"""
                 <div class="aa-side-alert">
-                    <div class="aa-side-alert-title">Attack intercepted</div>
+                    <div class="aa-side-alert-title">{svg_icon("shield-x", 16, 2.4)} Attack intercepted</div>
                     <div style="margin-bottom:0.35rem;">{get_status_pill_html(status)}</div>
                     <div>The injected gift card purchase was evaluated by the policy engine, not the agent.</div>
                 </div>
@@ -383,77 +522,99 @@ def render_chat_page():
     user_input = st.session_state.pop("prefill_prompt", None) or typed
 
     with page:
-        if len(st.session_state["messages"]) <= 1 and not user_input:
-            render_how_it_works_strip()
-            render_example_cards()
-            st.write("")
+        # One stable slot for the intro: when a prompt arrives it is cleared instead of
+        # shifting every later element (which left stale scenario cards on screen mid-run).
+        intro = st.empty()
+        is_fresh_chat = len(st.session_state["messages"]) <= 1 and not user_input
+        if is_fresh_chat:
+            with intro.container():
+                render_html(get_welcome_html())
+                render_html(get_pipeline_html(pipeline_states("intro")))
+                render_example_cards()
 
+        total_msgs = len(st.session_state["messages"])
         for idx, msg in enumerate(st.session_state["messages"]):
-            avatar = ":material/person:" if msg["role"] == "user" else ":material/smart_toy:"
+            if not is_fresh_chat and idx == 0 and not msg.get("ran") and msg.get("role") == "assistant":
+                continue
+            avatar = USER_AVATAR if msg["role"] == "user" else AGENT_AVATAR
+            is_last_msg = (idx == total_msgs - 1) and not user_input
             with st.chat_message(msg["role"], avatar=avatar):
                 if msg["role"] == "user":
-                    st.markdown(md_escape(msg.get("content", "")))
+                    render_user_bubble(msg.get("content", ""))
                 else:
-                    render_assistant_turn(msg, key_suffix=str(idx))
+                    render_assistant_turn(msg, key_suffix=str(idx), is_primary=is_last_msg)
 
-    if not user_input:
-        return
+        if not user_input:
+            render_html('<div class="aa-chat-bottom-spacer"></div>')
+            return
 
     with page:
         st.session_state["messages"].append({"role": "user", "content": user_input})
-        with st.chat_message("user", avatar=":material/person:"):
-            st.markdown(md_escape(user_input))
+        with st.chat_message("user", avatar=USER_AVATAR):
+            render_user_bubble(user_input)
 
         turn_idx = len(st.session_state["messages"])
-        with st.chat_message("assistant", avatar=":material/smart_toy:"):
+        with st.chat_message("assistant", avatar=AGENT_AVATAR):
             live_tool_calls: List[Dict[str, Any]] = []
             live_policy_decisions: List[Dict[str, Any]] = []
-            states = {"search": "active", "propose": "pending", "policy": "pending"}
-            details: Dict[str, str] = {}
+            # The strip is redrawn from the agent's own callbacks: each node lights
+            # up only when that step really happens (no timers, no fake delays).
+            live = {"phase": "searching", "detail": ""}
             steps_ph = st.empty()
-            render_html(get_live_steps_html(states, details), container=steps_ph)
+
+            def draw(status: Optional[str] = None, has_order: bool = False) -> None:
+                states = pipeline_states(live["phase"], status=status, has_order=has_order)
+                render_html(get_pipeline_html(states, live["detail"], compact=True), container=steps_ph)
+
+            draw()
 
             def on_tool_callback(tool_name: str, args: Dict[str, Any]):
                 live_tool_calls.append({"tool": tool_name, **args})
                 if "query" in args or tool_name == "search_products":
-                    states["search"] = "done"
+                    live["phase"] = "proposing"
                     if args.get("query"):
-                        details["search"] = f"\u201c{args['query']}\u201d"
-                    if states["propose"] == "pending":
-                        states["propose"] = "active"
+                        live["detail"] = f"\u201c{args['query']}\u201d"
                 elif "merchant" in args or tool_name == "propose_purchase":
-                    states["search"] = "done"
-                    states["propose"] = "done"
-                    details["propose"] = f"{args.get('merchant')} \u00b7 {_fmt_amount_text(args.get('amount', 0))}"
-                    states["policy"] = "active"
-                render_html(get_live_steps_html(states, details), container=steps_ph)
+                    live["phase"] = "checking"
+                    live["detail"] = _proposal_detail(args)
+                draw()
 
             def on_policy_callback(decision: Dict[str, Any]):
                 live_policy_decisions.append(decision)
-                states["policy"] = "done"
-                render_html(get_live_steps_html(states, details), container=steps_ph)
+                live["phase"] = "decided"
+                draw(decision.get("status"), bool(decision.get("paypal_order_id")))
 
-            active_provider = (Config.LLM_PROVIDER or "mock").lower()
-            agent = ShoppingAgent(provider=active_provider)
+            mode = st.session_state.get("aa_active_mode", MODE_MOCK)
+            agent = ShoppingAgent(provider=mode)
+            budget = requests_remaining(st.session_state, Config.LLM_SESSION_CAP) if mode == MODE_GEMINI else None
 
-            result = agent.run(
-                user_request=user_input,
-                on_tool_call=on_tool_callback,
-                on_policy_decision=on_policy_callback,
-            )
+            try:
+                result = agent.run(
+                    user_request=user_input,
+                    on_tool_call=on_tool_callback,
+                    on_policy_decision=on_policy_callback,
+                    max_llm_requests=budget,
+                )
+            except Exception as e:
+                result = {"error": str(e), "tool_calls": live_tool_calls, "proposal_result": None}
+            used = int(result.get("llm_requests") or 0)
+            record_requests(st.session_state, used)
 
             tool_calls = result.get("tool_calls", live_tool_calls) or live_tool_calls
-            if result.get("error"):
-                assistant_content = f"Encountered an issue: {result['error']}"
-            else:
-                assistant_content = result.get("agent_response", "")
+            error_text = friendly_agent_error(result)
+            notice = (
+                result.get("error_message")
+                if result.get("error_kind") == "session_cap" and not error_text else None
+            )
 
             msg = {
                 "role": "assistant",
-                "content": assistant_content,
+                "content": "" if error_text else result.get("agent_response", ""),
                 "tool_calls": tool_calls,
                 "proposal_result": result.get("proposal_result"),
-                "error": result.get("error"),
+                "error": error_text,
+                "error_kind": result.get("error_kind") if error_text else None,
+                "notice": notice,
                 "ran": True,
             }
             steps_ph.empty()
@@ -461,6 +622,12 @@ def render_chat_page():
 
             # Save assistant message into persistent session history
             st.session_state["messages"].append(msg)
+        render_html('<div class="aa-chat-bottom-spacer"></div>')
+
+    # Real LLM requests changed the session budget: rerun so the sidebar meter and
+    # mode pill (rendered before this page) show the new count.
+    if used:
+        st.rerun()
 
 
 # ==============================================================================
@@ -475,20 +642,24 @@ def render_approvals_page():
             "Purchases above your approval threshold wait here. Nothing is charged until you approve.",
         )
 
+        primary_used = False
         last = st.session_state.get("aa_last_approved")
         if last:
-            with st.container(border=True, key="aa-card-static-decision-approved-last"):
+            with st.container(key="aa-verdict-approved-last"):
+                note = ("Complete the payment in the PayPal sandbox." if last.get("url")
+                        else html_text(last.get("note") or "Recorded in the ledger."))
                 render_html(
-                    f'<div class="aa-card-head"><div class="aa-card-title">Transaction #{int(last["id"])} approved</div>'
-                    f'{get_status_pill_html("APPROVED")}</div>'
-                    f'<p class="aa-card-desc" style="margin-bottom:0.5rem;">'
-                    f'{"Complete the payment in the PayPal sandbox." if last.get("url") else html_text(last.get("note") or "Recorded in the ledger.")}</p>'
+                    f'<div class="aa-vhead"><div class="aa-vicon">{svg_icon("check", 28, 2.2)}</div>'
+                    f'<div class="aa-vtitle-wrap"><div class="aa-vtitle" role="heading" aria-level="3">'
+                    f'Transaction #{int(last["id"])} approved</div><div class="aa-vsub">{note}</div></div>'
+                    f'{get_status_pill_html("APPROVED")}</div><div style="height:0.5rem"></div>'
                 )
                 c1, c2 = st.columns([3, 1])
                 with c1:
                     if last.get("url"):
                         st.link_button("Pay with PayPal sandbox", last["url"], type="primary",
                                        icon=":material/open_in_new:", width="stretch")
+                        primary_used = True
                 with c2:
                     if st.button("Dismiss", key="aa_dismiss_last", width="stretch"):
                         st.session_state.pop("aa_last_approved", None)
@@ -500,45 +671,46 @@ def render_approvals_page():
             render_html(get_empty_state_html(
                 "You're all caught up",
                 "No purchases are waiting for approval. Anything above your threshold will show up here.",
-                icon='<span class="aa-msym">task_alt</span>',
+                illustration=APPROVALS_EMPTY_ILLUSTRATION,
             ))
             if _PAGES.get("chat"):
                 st.page_link(_PAGES["chat"], label="Ask the agent to buy something", icon=":material/chat:")
             return
 
-        render_html(f'<div class="aa-label" style="margin-bottom:0.6rem;">{len(pending_items)} waiting for review</div>')
+        render_html(f'<div class="aa-label" style="margin-bottom:0.4rem;">{len(pending_items)} waiting for review</div>')
 
         for item in pending_items:
             ledger_id = item["id"]
             reasons_list = _parse_reasons(item.get("reasons"))
-            reasons_html = "".join(f"<li>{html_text(r)}</li>" for r in reasons_list)
+            subtitle_str = f"Request #{ledger_id} · {item.get('created_at') or 'Decided by rules, not the agent'}"
 
-            with st.container(border=True, key=f"aa-card-pending-{ledger_id}"):
+            with st.container(key=f"aa-verdict-pending-{ledger_id}"):
                 render_html(
-                    f"""
-                    <div class="aa-card-head">
-                        <div class="aa-card-title">#{ledger_id} · {html_text(item['merchant'])}</div>
-                        {get_status_pill_html("NEEDS_APPROVAL")}
-                    </div>
-                    <div class="aa-kv">
-                        <div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(item['amount'], item.get('currency'))}</div></div>
-                        <div><div class="aa-label">Category</div><div class="aa-v">{html_text(item.get('category'))}</div></div>
-                        <div><div class="aa-label">Requested</div><div class="aa-v">{html_text(item.get('created_at'))}</div></div>
-                    </div>
-                    <div class="aa-label">Agent&#39;s reason</div>
-                    <p class="aa-reason">{html_text(item.get('reason') or 'No reason provided')}</p>
-                    {f'<div class="aa-label">Why it needs you</div><ul class="aa-reasons">{reasons_html}</ul>' if reasons_html else ''}
-                    """
+                    get_verdict_html(
+                        status="NEEDS_APPROVAL",
+                        title="Needs your approval",
+                        subtitle=subtitle_str,
+                        merchant=item["merchant"],
+                        amount=item["amount"],
+                        currency=item.get("currency") or "USD",
+                        category=item.get("category") or "General",
+                        reason=item.get("reason") or "No reason provided",
+                        policy_reasons=reasons_list,
+                        next_step="Approve below to create a PayPal sandbox order immediately, or reject to cancel without charging.",
+                    )
                 )
+                render_html('<div style="height:12px;"></div>')
 
-                col_app, col_rej, _ = st.columns([1.2, 1.2, 3])
+                btn_type = "secondary" if primary_used else "primary"
+                primary_used = True
+                col_app, col_rej, _ = st.columns([1.3, 1.3, 3])
                 with col_app:
-                    if st.button("Approve", key=f"app_btn_{ledger_id}", type="primary",
+                    if st.button("Approve and pay", key=f"app_btn_{ledger_id}", type=btn_type,
                                  icon=":material/check:", width="stretch"):
                         try:
                             app_res = approve_pending(ledger_id)
                         except ValueError as e:
-                            st.error(md_escape(str(e)))
+                            st.error(md_escape(safe_error_text(e, "This purchase could not be approved.")))
                             app_res = None
                         if app_res and app_res.get("approved"):
                             queue_toast(f"Approved #{ledger_id} ({_fmt_amount_text(item['amount'])} at {item['merchant']}).",
@@ -549,7 +721,8 @@ def render_approvals_page():
                                 last_info["url"] = ord_res.get("approval_url")
                                 last_info["order_id"] = ord_res.get("order_id")
                             except Exception as e:
-                                last_info["note"] = f"Approved, but no PayPal sandbox order was created: {e}"
+                                last_info["note"] = "Approved, but no PayPal sandbox order was created" + (
+                                    "." if Config.DEMO_PUBLIC else f": {safe_error_text(e)}")
                                 queue_toast("PayPal sandbox order could not be created.", ":material/warning:")
                             st.session_state["aa_last_approved"] = last_info
                             st.rerun()
@@ -558,7 +731,7 @@ def render_approvals_page():
                                      icon=":material/block:")
 
                 with col_rej:
-                    if st.button("Reject", key=f"rej_btn_{ledger_id}", icon=":material/close:", width="stretch"):
+                    if st.button("Reject", key=f"rej_btn_{ledger_id}", icon=":material/block:", width="stretch"):
                         reject_pending(ledger_id, rejection_reason="Rejected by supervisor in dashboard.")
                         queue_toast(f"Rejected #{ledger_id}. No payment was made.", ":material/cancel:")
                         st.rerun()
@@ -607,7 +780,7 @@ def render_rules_page():
         with col_l:
             with st.container(border=True, key="aa-card-static-limits"):
                 render_html(
-                    '<div class="aa-icon-chip"><span class="aa-msym">payments</span></div>'
+                    f'<div class="aa-icon-chip">{svg_icon("wallet", 22)}</div>'
                     '<div class="aa-card-title">Spending limits</div>'
                     '<p class="aa-card-desc">Checked on every purchase the agent proposes.</p>'
                 )
@@ -638,14 +811,14 @@ def render_rules_page():
         with col_r:
             with st.container(border=True, key="aa-card-static-merchants"):
                 render_html(
-                    '<div class="aa-icon-chip"><span class="aa-msym">storefront</span></div>'
+                    f'<div class="aa-icon-chip">{svg_icon("store", 22)}</div>'
                     '<div class="aa-card-title">Approved merchants</div>'
                     '<p class="aa-card-desc">Purchases from any merchant not on this list are blocked.</p>'
                 )
                 merchants_val = st.text_area(
                     "Allowed merchants",
                     key="rule_allowed_merchants",
-                    height=140,
+                    height=136,
                     placeholder="Golden Grain Mills, Corner Office Supply",
                     help="Comma-separated, case-insensitive.",
                 )
@@ -666,7 +839,6 @@ def render_rules_page():
             f"{_to_float(db_values[rt], d):.2f}" != current[rt] for rt, _, d, _ in _NUMERIC_RULES
         ) or (db_values["allowed_merchants"].strip() != current["allowed_merchants"].strip())
 
-        st.write("")
         b1, b2 = st.columns([1, 4], vertical_alignment="center")
         with b1:
             save = st.button("Save rules", type="primary", icon=":material/save:", width="stretch", key="aa_save_rules")
@@ -676,7 +848,7 @@ def render_rules_page():
             elif dirty:
                 render_html('<span class="aa-dirty">You have unsaved changes.</span>')
             else:
-                render_html('<span class="aa-muted" style="font-size:0.85rem;">All changes saved.</span>')
+                render_html(f'<span class="aa-saved">{svg_icon("check", 16, 2.6)} All changes saved.</span>')
 
         if save:
             updates = [
@@ -699,7 +871,7 @@ def render_rules_page():
                     queue_toast("Rules saved. New limits apply to future purchases.", ":material/check_circle:")
                     st.rerun()
                 except Exception as e:
-                    st.error(md_escape(f"Error saving rules: {e}"))
+                    st.error(md_escape(f"Error saving rules: {safe_error_text(e, 'please try again.')}"))
 
 
 # ==============================================================================
@@ -823,21 +995,21 @@ def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
              "valueFormatter": JsCode("function(p){ return p.value == null ? 'Total' : '#' + p.value; }"),
              "cellClass": "aa-muted"},
             # Explicit "text": v34 otherwise infers dateTimeString and blanks the pinned "N rows" cell.
-            {"field": "timestamp", "headerName": "Time (UTC)", "width": 120, "cellDataType": "text",
+            {"field": "timestamp", "headerName": "Time (UTC)", "width": 138, "cellDataType": "text",
              "filter": "agTextColumnFilter", "wrapText": True, "autoHeight": True},
-            {"field": "merchant", "headerName": "Merchant", "flex": 1, "minWidth": 140, "cellDataType": "text",
+            {"field": "merchant", "headerName": "Merchant", "flex": 1, "minWidth": 150, "cellDataType": "text",
              "filter": "agTextColumnFilter", "cellClass": "aa-merchant", "tooltipField": "category",
              "wrapText": True, "autoHeight": True},
-            {"field": "amount_value", "headerName": "Amount", "width": 108, "type": "rightAligned", "cellDataType": "number",
+            {"field": "amount_value", "headerName": "Amount", "width": 104, "type": "rightAligned", "cellDataType": "number",
              "filter": "agNumberColumnFilter", "valueFormatter": money_formatter, "cellClass": "aa-amount"},
             {"field": "status", "headerName": "Status", "width": 160, "cellDataType": "text", "filter": "agTextColumnFilter",
              "cellRenderer": status_renderer,
              "filterValueGetter": JsCode(f"function(p){{ return ({status_label_js})(p.data.status); }}"),
              "getQuickFilterText": JsCode(f"function(p){{ return ({status_label_js})(p.value); }}")},
-            {"field": "reasons_text", "headerName": "Reasons", "flex": 2, "minWidth": 210, "cellDataType": "text",
+            {"field": "reasons_text", "headerName": "Reasons", "flex": 2, "minWidth": 220, "cellDataType": "text",
              "filter": "agTextColumnFilter", "cellRenderer": reasons_renderer, "cellClass": "aa-reasons-cell",
              "wrapText": True, "autoHeight": True, "tooltipField": "reasons_text"},
-            {"field": "paypal_order_id", "headerName": "PayPal order", "width": 160, "cellDataType": "text",
+            {"field": "paypal_order_id", "headerName": "PayPal order", "width": 148, "cellDataType": "text",
              "filter": "agTextColumnFilter", "cellClass": "aa-mono", "tooltipField": "paypal_order_id"},
         ],
         "defaultColDef": {"sortable": True, "resizable": True, "filter": True, "suppressHeaderMenuButton": False},
@@ -921,34 +1093,53 @@ def _render_ledger_fallback(
 def _render_ledger_detail(row: Dict[str, Any]) -> None:
     """Detail card for the selected ledger row (all text HTML-escaped and $-safe)."""
     proposal = row.get("proposal") or {}
-    reasons_html = "".join(f"<li>{html_text(r)}</li>" for r in row["reasons"]) or \
-        '<li class="aa-muted">No reasons recorded.</li>'
+    cls = status_card_key(row["status"])
+    reasons_html = "".join(
+        f'<li><span class="aa-reason-dot aa-dot-{cls}"></span><span>{html_text(r)}</span></li>'
+        for r in row["reasons"]
+    ) or '<li class="aa-muted">No reasons recorded.</li>'
     order = row.get("paypal_order_id")
     order_html = f'<span class="aa-mono">{html_text(order)}</span>' if order else '<span class="aa-muted">None</span>'
     capture = row.get("paypal_capture_id")
     capture_html = f'<span class="aa-mono">{html_text(capture)}</span>' if capture else '<span class="aa-muted">None</span>'
     item = proposal.get("item_title") or proposal.get("item_id") or ""
     agent_reason = row.get("agent_reason") or proposal.get("reason") or ""
-    with st.container(border=True, key=f"aa-card-static-ledger-{status_card_key(row['status'])}"):
-        render_html(f"""
-            <div class="aa-card-head">
-                <div class="aa-card-title">#{row['id']} · {html_text(row['merchant'])}</div>
-                {get_status_pill_html(row['status'])}
-            </div>
-            <div class="aa-kv">
-                <div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(row['amount'], row['currency'])}</div></div>
-                <div><div class="aa-label">Category</div><div class="aa-v">{html_text(row['category'])}</div></div>
-                <div><div class="aa-label">Time (UTC)</div><div class="aa-v">{html_text(row['timestamp'])}</div></div>
-            </div>
-            <div class="aa-kv">
-                <div><div class="aa-label">Proposal ID</div><div class="aa-v aa-mono">{html_text(row.get('proposal_id'))}</div></div>
-                <div><div class="aa-label">PayPal order</div><div class="aa-v">{order_html}</div></div>
-                {f'<div><div class="aa-label">Capture ID</div><div class="aa-v">{capture_html}</div></div>' if capture else (f'<div><div class="aa-label">Item</div><div class="aa-v">{html_text(item)}</div></div>' if item else '')}
-            </div>
-            {f'<div class="aa-label">Agent&#39;s reason</div><p class="aa-reason">{html_text(agent_reason)}</p>' if agent_reason else ''}
-            <div class="aa-label">Policy reasons</div>
-            <ul class="aa-reasons">{reasons_html}</ul>
-        """)
+
+    extra_kv = ""
+    if capture:
+        extra_kv = f'<div><div class="aa-label">Capture ID</div><div class="aa-v">{capture_html}</div></div>'
+    elif item:
+        extra_kv = f'<div><div class="aa-label">Item</div><div class="aa-v">{html_text(item)}</div></div>'
+
+    agent_reason_block = (
+        f'<div class="aa-label">Agent&#39;s reason</div><p class="aa-reason" style="margin:0 0 8px 0;font-size:13px;">{html_text(agent_reason)}</p>'
+        if agent_reason else ""
+    )
+
+    markup = (
+        f'<div class="aa-decision-card aa-decision-{cls}">'
+        f'<div class="aa-decision-accent aa-accent-{cls}"></div>'
+        f'<div class="aa-decision-inner">'
+        f'<div class="aa-card-head">'
+        f'<div class="aa-card-title">#{html_text(row["id"])} · {html_text(row["merchant"])}</div>'
+        f'{get_status_pill_html(row["status"])}'
+        f"</div>"
+        f'<div class="aa-kv">'
+        f'<div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(row["amount"], row["currency"])}</div></div>'
+        f'<div><div class="aa-label">Category</div><div class="aa-v">{html_text(row["category"])}</div></div>'
+        f'<div><div class="aa-label">Time (UTC)</div><div class="aa-v">{html_text(row["timestamp"])}</div></div>'
+        f'<div><div class="aa-label">Proposal ID</div><div class="aa-v aa-mono">{html_text(row.get("proposal_id"))}</div></div>'
+        f'<div><div class="aa-label">PayPal order</div><div class="aa-v">{order_html}</div></div>'
+        f"{extra_kv}"
+        f"</div>"
+        f"{agent_reason_block}"
+        f'<div class="aa-label">Policy reasons</div>'
+        f'<ul class="aa-verdict-reasons" style="margin-bottom:0;">{reasons_html}</ul>'
+        f"</div>"
+        f"</div>"
+    )
+    with st.container(key=f"aa-verdict-{cls}-ledger"):
+        render_html(markup)
 
 
 def _selected_ledger_id(grid: Any) -> Optional[int]:
@@ -975,41 +1166,67 @@ def render_ledger_page():
             render_html(get_empty_state_html(
                 "No transactions yet",
                 "Ask the agent to buy something and every decision will be recorded here.",
-                icon='<span class="aa-msym">receipt_long</span>',
+                illustration=LEDGER_EMPTY_ILLUSTRATION,
             ))
             return
 
-        f1, f2 = st.columns([4, 1], vertical_alignment="bottom")
-        with f1:
+        # Preset status filter buttons + search input + Export CSV
+        preset_options = [
+            ("ALL", "All"),
+            ("APPROVED", "Approved"),
+            ("NEEDS_APPROVAL", "Needs approval"),
+            ("BLOCKED", "Blocked"),
+            ("EXECUTED", "Executed"),
+        ]
+        active_preset = st.session_state.get("aa_ledger_preset", "ALL")
+
+        p_cols = st.columns([0.8, 1.0, 1.25, 0.95, 1.0, 2.6, 1.3], vertical_alignment="center")
+        for idx, (p_key, p_lbl) in enumerate(preset_options):
+            with p_cols[idx]:
+                if st.button(
+                    p_lbl,
+                    key=f"aa_ledger_preset_{p_key}",
+                    type="primary" if active_preset == p_key else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state["aa_ledger_preset"] = p_key
+                    st.rerun()
+
+        with p_cols[5]:
             query = st.text_input(
                 "Search", placeholder="Search merchant, status, reason or order ID", key="aa_ledger_q",
-                icon=":material/search:",
+                icon=":material/search:", label_visibility="collapsed",
             )
         quick_filter = (query or "").strip()
 
+        filtered_rows = (
+            rows if active_preset == "ALL"
+            else [r for r in rows if (r.get("status") or "").upper() == active_preset]
+        )
+
         grid = None
         fallback_id: Optional[int] = None
-        export_rows = rows
+        export_rows = filtered_rows
         if AgGrid is None:
             export_rows, fallback_id = _render_ledger_fallback(
-                rows, quick_filter, "Interactive grid unavailable (streamlit-aggrid not installed). Showing a basic table.")
+                filtered_rows, quick_filter, "Interactive grid unavailable (streamlit-aggrid not installed). Showing a basic table.")
         else:
             try:
-                grid = _render_ledger_grid(rows, quick_filter)
+                grid = _render_ledger_grid(filtered_rows, quick_filter)
             except Exception:
                 grid = None
                 export_rows, fallback_id = _render_ledger_fallback(
-                    rows, quick_filter, "Interactive grid failed to load. Showing a basic table.")
+                    filtered_rows, quick_filter, "Interactive grid failed to load. Showing a basic table.")
 
         # Export what the grid currently shows (filters + sort).
         try:
             shown = grid.data if grid is not None else None
             if shown is not None and "id" in shown.columns:
-                by_id = {r["id"]: r for r in rows}
+                by_id = {r["id"]: r for r in filtered_rows}
                 export_rows = [by_id[int(i)] for i in shown["id"].dropna() if int(i) in by_id]
         except Exception:
             pass
-        with f2:
+        with p_cols[6]:
             st.download_button(
                 "Export CSV", data=_ledger_csv(export_rows), file_name="agent_allowance_ledger.csv",
                 mime="text/csv", icon=":material/download:", width="stretch", key="aa_ledger_export",
@@ -1140,10 +1357,10 @@ def render_payment_return_panel(db_path: Optional[str] = None) -> None:
     with st.container():
         if status == "cancelled":
             render_html("""
-                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid #94A3B8; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.25rem;">
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-rejected-solid); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
                         <div>
-                            <div style="font-weight:700; font-size:1rem; color:var(--aa-text);">Payment was cancelled</div>
+                            <div style="font-weight:600; font-size:1rem; color:var(--aa-text-heading);">Payment was cancelled</div>
                             <div style="font-size:0.88rem; color:var(--aa-text-muted); margin-top:0.25rem;">The PayPal checkout session was cancelled. Your monthly budget, allowance, and ledger remain completely unchanged.</div>
                         </div>
                     </div>
@@ -1158,13 +1375,13 @@ def render_payment_return_panel(db_path: Optional[str] = None) -> None:
             capture_id = res.get("capture_id") or ""
             order_id = res.get("order_id") or ""
             render_html(f"""
-                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-approved-fg); border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-approved-fg); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
-                        <div style="font-weight:700; font-size:1.05rem; color:var(--aa-text);">Payment Return · COMPLETED</div>
+                        <div style="font-weight:600; font-size:1rem; color:var(--aa-text);">Payment Return · COMPLETED</div>
                         <span class="aa-pill executed">COMPLETED</span>
                     </div>
                     <div style="font-size:0.88rem; color:var(--aa-text-soft); line-height:1.5;">
-                        Transaction <strong>#{row.get('id', '')}</strong> ({html_text(row.get('merchant', ''))}) for <strong>{money_html(row.get('amount', '0.00'), row.get('currency', 'USD'))}</strong> has been successfully captured in PayPal Sandbox.
+                        Transaction <strong>#{html_text(row.get('id', ''))}</strong> ({html_text(row.get('merchant', ''))}) for <strong>{money_html(row.get('amount', '0.00'), row.get('currency', 'USD'))}</strong> has been successfully captured in PayPal Sandbox.
                     </div>
                     <div style="display:flex; gap:1.5rem; margin-top:0.6rem; font-size:0.82rem; color:var(--aa-text-muted);">
                         <div>Order ID: <span class="aa-mono">{html_text(order_id)}</span></div>
@@ -1181,9 +1398,9 @@ def render_payment_return_panel(db_path: Optional[str] = None) -> None:
             paypal_status = res.get("paypal_status", "PENDING")
             order_id = res.get("order_id", "")
             render_html(f"""
-                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid #F59E0B; border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-pending-solid); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
-                        <div style="font-weight:700; font-size:1.05rem; color:var(--aa-text);">Payment Return · Awaiting Buyer Approval</div>
+                        <div style="font-weight:600; font-size:1rem; color:var(--aa-text-heading);">Payment Return · Awaiting Buyer Approval</div>
                         <span class="aa-pill pending">{html_text(paypal_status)}</span>
                     </div>
                     <div style="font-size:0.88rem; color:var(--aa-text-soft); line-height:1.5;">
@@ -1204,9 +1421,9 @@ def render_payment_return_panel(db_path: Optional[str] = None) -> None:
             row = res.get("row") or {}
             msg = res.get("message", "")
             render_html(f"""
-                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-blocked-fg); border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-blocked-fg); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
-                        <div style="font-weight:700; font-size:1.05rem; color:var(--aa-text);">Payment Return · Capture Refused</div>
+                        <div style="font-weight:600; font-size:1rem; color:var(--aa-text);">Payment Return · Capture Refused</div>
                         <span class="aa-pill blocked">{html_text(row.get('status', 'BLOCKED'))}</span>
                     </div>
                     <div style="font-size:0.88rem; color:var(--aa-text-soft);">
@@ -1220,9 +1437,11 @@ def render_payment_return_panel(db_path: Optional[str] = None) -> None:
 
         elif status == "error":
             msg = res.get("message", "An error occurred while processing the payment return.")
+            if Config.DEMO_PUBLIC:
+                msg = "We could not confirm this payment with PayPal. Please try again."
             render_html(f"""
-                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-blocked-fg); border-radius: 10px; padding: 1.1rem 1.25rem; margin-bottom: 1.25rem;">
-                    <div style="font-weight:700; font-size:1rem; color:var(--aa-text);">Payment Return Error</div>
+                <div style="background: var(--aa-surface); border: 1px solid var(--aa-border); border-left: 4px solid var(--aa-blocked-fg); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem;">
+                    <div style="font-weight:600; font-size:1rem; color:var(--aa-text);">Payment Return Error</div>
                     <div style="font-size:0.88rem; color:var(--aa-text-soft); margin-top:0.25rem;">{html_text(msg)}</div>
                 </div>
             """)
@@ -1258,12 +1477,17 @@ def main():
     _PAGES.update(chat=chat_page, approvals=approvals_page, rules=rules_page, ledger=ledger_page)
 
     pg = st.navigation([chat_page, approvals_page, rules_page, ledger_page])
+    is_chat = pg == chat_page
 
-    # Unified header & metrics at top of every page (metrics refreshed after the page runs)
-    render_header()
+    # Mode toggle first so the header pill shows the mode this run will use.
+    active_mode, mode_note = render_sidebar_mode_control()
+
+    # Single-row page header (22px page title on left, neutral mode pill on right)
+    # and unified summary strip on EVERY page
+    render_header(active_mode, mode_note, show_tagline=is_chat, page_title=pg.title)
     metrics_slot = st.empty()
     with metrics_slot.container():
-        render_metrics_banner()
+        render_metrics_banner(compact_strip=True)
 
     # Render payment return banner if returning from PayPal
     render_payment_return_panel()
@@ -1271,12 +1495,18 @@ def main():
     # Persistent sidebar demo tools
     render_sidebar_demo_tools()
 
-    # Execute selected page
-    pg.run()
+    # Execute selected page. A public demo never shows a raw traceback.
+    if Config.DEMO_PUBLIC:
+        try:
+            pg.run()
+        except Exception:
+            st.error(GENERIC_ERROR, icon=":material/error:")
+    else:
+        pg.run()
 
     # Refresh metrics so they reflect anything the page just did (e.g. a new purchase).
     with metrics_slot.container():
-        render_metrics_banner()
+        render_metrics_banner(compact_strip=True)
 
 
 if __name__ == "__main__":

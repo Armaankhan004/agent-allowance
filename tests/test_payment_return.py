@@ -8,7 +8,9 @@ Unit tests for the complete payment loop:
 - Monthly budget counting both APPROVED and EXECUTED
 """
 
+from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Optional
 from unittest.mock import patch, MagicMock
 import pytest
 
@@ -40,8 +42,10 @@ def _insert_tx(
     amount: float = 25.00,
     paypal_order_id: str = "",
     paypal_capture_id: str = "",
-    created_at: str = "2026-10-28 12:00:00",
+    created_at: Optional[str] = None,
 ) -> int:
+    if created_at is None:
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     cursor.execute(

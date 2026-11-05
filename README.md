@@ -112,6 +112,19 @@ streamlit run agent_allowance/app.py
 
 Open `http://localhost:8501` in your browser.
 
+### 5. Mock vs. Gemini, Quotas & Public Demos
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DEFAULT_MODE` | `LLM_PROVIDER` | Starting mode for new sessions (`mock` or `gemini`). Mock is forced when no LLM key is set. |
+| `LLM_SESSION_CAP` | `10` | Max real Gemini requests per browser session. At zero the session switches to Mock. Mock is never capped. |
+| `DEMO_PUBLIC` | `false` | Hides Reset behind an extra confirmation and replaces raw exception text with a generic message. |
+
+- Switch modes at any time from **Agent mode** in the sidebar; the header pill shows the active mode.
+- Gemini 429 / `RESOURCE_EXHAUSTED` errors show one short message (with the retry time when Gemini sends one) and a **Switch to Mock mode** button. Quota errors are not retried.
+- The cap lives in Streamlit session state, so refreshing the page starts a new session. It limits accidental burn, not a determined visitor; set a quota on the API key itself too.
+- For a public deploy, also set `STREAMLIT_CLIENT_SHOW_ERROR_DETAILS=none`. Auto-reload on save is off in the shipped config; pass `--server.runOnSave true` locally if you want it.
+
 ---
 
 ### 💳 Approving a PayPal Sandbox Payment & The Return Loop

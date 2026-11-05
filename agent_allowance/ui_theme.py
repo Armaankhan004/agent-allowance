@@ -1,896 +1,1973 @@
 """
-UI Theme and Design System for Agent Allowance.
+Presentation-layer design system for Agent Allowance (Redesign v4: Calm Neutral UI).
 
-Presentation only: design tokens, global CSS, and small HTML render helpers
-(status pills, header, metric cards, budget bar, live agent steps, decision card).
-No policy, agent, database, or PayPal logic lives here.
+Centralizes:
+- Calm, white, low-saturation design tokens (`TOKENS`) mirrored in `.streamlit/config.toml`
+- WCAG 2.1 contrast helpers (`relative_luminance`, `contrast_ratio`)
+- Budget progress bar threshold helpers (`gauge_level`, `gauge_color`)
+- Single-row page header (`render_header`, `get_page_header_html`)
+- Compact summary strip on every page (`render_metrics_banner`, `get_summary_strip_html`)
+- 3-node pipeline strip (`pipeline_states`, `get_pipeline_html`)
+- Unified decision card (`get_verdict_html`) for Chat and Approvals
+- Neutral SVG empty-state illustrations (`get_empty_state_html`, `get_welcome_html`)
+- AG Grid v4 theme configuration (`get_aggrid_theme_params`, `get_aggrid_custom_css`)
 
-Theming strategy (Streamlit 1.65):
-  * `.streamlit/config.toml` sets a LIGHT global theme and scopes the navy palette
-    to the sidebar via `[theme.sidebar]`. The old config set
-    `secondaryBackgroundColor = "#0F172A"`, which Streamlit also uses as the fill
-    color for inputs/selects/chat input, producing black boxes with dark text.
-  * This module adds the finer details (cards, pills, transitions) as CSS that
-    reads every color from the TOKENS below via CSS custom properties.
-
-Dollar signs: Streamlit markdown renders `$...$` as LaTeX. Use `md_escape()` for
-markdown strings and `html_text()` / `money_html()` inside HTML blocks.
+Presentation only — contains no policy, agent, database, or PayPal business logic.
 """
 
-import html
-from typing import Any, Dict, Iterable, List, Optional
-
+from decimal import Decimal
+import html as _html
+from typing import Any
 import streamlit as st
 
-from agent_allowance.config import Config
 from agent_allowance.db import get_dashboard_metrics
 
 
 # ==============================================================================
-# Design tokens
+# 1. V4 CALM NEUTRAL PALETTE & DESIGN TOKENS (Single Source of Truth)
 # ==============================================================================
-
-TOKENS: Dict[str, str] = {
-    # Surfaces & text
-    "bg": "#F7F8FA",
+TOKENS: dict[str, str] = {
+    # Surfaces & Borders
+    "canvas": "#FAFAF9",
     "surface": "#FFFFFF",
-    "surface-muted": "#F8FAFC",
-    "border": "#E2E8F0",
-    "input-border": "#CBD5E1",
-    "text": "#0F172A",
-    "text-muted": "#64748B",
-    "text-soft": "#334155",
-    "placeholder": "#94A3B8",
-    # Brand
-    "primary": "#2563EB",
-    "primary-hover": "#1D4ED8",
-    "primary-soft": "#EFF6FF",
-    "focus-ring": "rgba(37, 99, 235, 0.25)",
-    # Sidebar
-    "sidebar-bg": "#0F172A",
-    "sidebar-surface": "#1E293B",
-    "sidebar-surface-hover": "#334155",
-    "sidebar-border": "#334155",
-    "sidebar-text": "#E2E8F0",
-    "sidebar-muted": "#94A3B8",
-    "sidebar-accent": "#60A5FA",
-    # Status pills (text on background; all >= 4.5:1, WCAG AA)
-    "approved-fg": "#15803D",
-    "approved-bg": "#DCFCE7",
-    "pending-fg": "#B45309",
-    "pending-bg": "#FEF3C7",
-    "blocked-fg": "#B91C1C",
-    "blocked-bg": "#FEE2E2",
-    "rejected-fg": "#475569",
-    "rejected-bg": "#E2E8F0",
-    "executed-fg": "#1D4ED8",
-    "executed-bg": "#DBEAFE",
-    # Budget bar
-    "bar-track": "#E2E8F0",
-    "bar-ok": "#2563EB",
-    "bar-warn": "#D97706",
-    "bar-danger": "#DC2626",
-    # Shape & motion
-    "radius-card": "12px",
+    "border": "#E7E5E4",
+    "border-strong": "#D6D3D1",
+    "divider": "#F0EFED",
+    # Text hierarchy (never lighter than #78716C for text)
+    "ink": "#1C1917",
+    "text-secondary": "#57534E",
+    "text-muted": "#78716C",
+    # Buttons
+    "primary-bg": "#1C1917",
+    "primary-hover": "#292524",
+    "primary-text": "#FFFFFF",
+    "secondary-bg": "#FFFFFF",
+    "secondary-border": "#D6D3D1",
+    "secondary-text": "#44403C",
+    "secondary-hover": "#F5F5F4",
+    # Accent (use sparingly: active nav item text & links, active nav bg, focus ring)
+    "plum": "#4A3357",
+    "accent": "#4A3357",
+    "nav-active-bg": "#F3EFF5",
+    "focus-ring-hex": "#6B4C7A",
+    "focus-ring": "rgba(107, 76, 122, 0.35)",
+    # Status (muted)
+    # Approved
+    "approved-fg": "#2F6B3E",
+    "approved-bg": "#EEF5EF",
+    "approved-border": "#CFE3D3",
+    "approved-bar": "#5E9B6E",
+    "approved-dot": "#5E9B6E",
+    # Needs approval
+    "pending-fg": "#8A5A12",
+    "pending-bg": "#FBF5E8",
+    "pending-border": "#EBDDBB",
+    "pending-bar": "#C79A3B",
+    "pending-dot": "#C79A3B",
+    # Blocked
+    "blocked-fg": "#9B3B3B",
+    "blocked-bg": "#FBEFEF",
+    "blocked-border": "#EBCFCF",
+    "blocked-bar": "#B45454",
+    "blocked-dot": "#B45454",
+    # Rejected
+    "rejected-fg": "#57534E",
+    "rejected-bg": "#F5F5F4",
+    "rejected-border": "#E7E5E4",
+    "rejected-bar": "#A8A29E",
+    "rejected-dot": "#A8A29E",
+    # Executed (uses approved palette with label "Executed")
+    "executed-fg": "#2F6B3E",
+    "executed-bg": "#EEF5EF",
+    "executed-border": "#CFE3D3",
+    "executed-bar": "#5E9B6E",
+    "executed-dot": "#5E9B6E",
+    # Chat & Grid surfaces
+    "user-bubble-bg": "#F1F0EE",
+    "user-bubble-fg": "#1C1917",
+    "grid-header-bg": "#F5F5F4",
+    "grid-header-fg": "#1C1917",
+    "grid-selected-bg": "#F3EFF5",
+    # Sidebar (white, 1px right border)
+    "sidebar-bg": "#FFFFFF",
+    "sidebar-surface": "#FAFAF9",
+    "sidebar-border": "#E7E5E4",
+    "sidebar-text": "#1C1917",
+    "sidebar-captions": "#57534E",
+    "sidebar-nav-inactive": "#57534E",
+    # Summary bar / gauge thresholds (ink < 75%, amber 75-90%, red > 90%)
+    "gauge-ok": "#1C1917",
+    "gauge-warn": "#C79A3B",
+    "gauge-danger": "#B45454",
+    "gauge-track": "#F0EFED",
+    # Radii, shadow & typography
+    "radius-card": "10px",
     "radius-input": "10px",
+    "radius-button": "7px",
     "radius-pill": "9999px",
-    "shadow-sm": "0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06)",
-    "shadow-md": "0 4px 12px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.04)",
-    "font": "'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
-    "ease": "cubic-bezier(0.2, 0.8, 0.2, 1)",
-    "t-fast": "150ms",
-    "t-page": "250ms",
+    "shadow": "0 1px 2px rgba(0, 0, 0, 0.04)",
+    "font-sans": "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    "font-mono": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    # Semantic aliases for compatibility
+    "bg": "#FAFAF9",
+    "surface-muted": "#F5F5F4",
+    "border-solid": "#E7E5E4",
+    "primary": "#1C1917",
+    "text-heading": "#1C1917",
+    "text": "#1C1917",
+    "text-soft": "#57534E",
 }
-
-# Budget bar thresholds (fraction of monthly budget used)
-BAR_WARN_AT = 0.75
-BAR_DANGER_AT = 0.90
-
-STATUS_META: Dict[str, Dict[str, str]] = {
-    "APPROVED": {"label": "Approved", "cls": "approved"},
-    "NEEDS_APPROVAL": {"label": "Needs approval", "cls": "pending"},
-    "BLOCKED": {"label": "Blocked", "cls": "blocked"},
-    "REJECTED": {"label": "Rejected", "cls": "rejected"},
-    "EXECUTED": {"label": "Executed", "cls": "executed"},
-}
-
-
-def _root_vars() -> str:
-    return "\n".join(f"    --aa-{k}: {v};" for k, v in TOKENS.items())
 
 
 # ==============================================================================
-# Global CSS (all colors via var(--aa-*))
+# 2. WCAG 2.1 CONTRAST UTILITIES
 # ==============================================================================
-
-_CSS_BODY = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-html, body, .stApp, .stApp button, .stApp input, .stApp textarea, .stApp select {
-    font-family: var(--aa-font);
-}
-.stApp { background: var(--aa-bg); color: var(--aa-text); }
-
-/* ---------- Chrome: hide Deploy, footer, decoration ---------- */
-[data-testid="stAppDeployButton"], [data-testid="stDecoration"],
-#MainMenu, footer, [data-testid="stStatusWidget"] { display: none !important; }
-header[data-testid="stHeader"] { background: transparent; }
-[data-testid="stMainBlockContainer"] { padding-top: 2.25rem; max-width: 1180px; }
-
-/* ---------- Page transition ---------- */
-@keyframes aa-fade-up {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
-[class*="st-key-aa-page-"] { animation: aa-fade-up var(--aa-t-page) var(--aa-ease) both; }
-
-/* ---------- Typography helpers ---------- */
-.aa-section { margin: 0.25rem 0 1rem 0; }
-.aa-section h2 {
-    font-size: 1.3rem; font-weight: 700; color: var(--aa-text);
-    letter-spacing: -0.01em; margin: 0; padding: 0;
-}
-.aa-section p { color: var(--aa-text-muted); font-size: 0.92rem; margin: 0.25rem 0 0 0; }
-.aa-muted { color: var(--aa-text-muted); }
-.aa-label {
-    font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.05em; color: var(--aa-text-muted);
-}
-
-/* ---------- Header ---------- */
-.aa-header {
-    display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem;
-    padding-bottom: 1.1rem; margin-bottom: 1.25rem; border-bottom: 1px solid var(--aa-border);
-}
-.aa-header h1 {
-    font-size: 1.85rem; font-weight: 700; letter-spacing: -0.025em;
-    color: var(--aa-text); margin: 0; padding: 0; line-height: 1.15;
-}
-.aa-header .aa-tagline { color: var(--aa-text-muted); font-size: 0.98rem; margin: 0.3rem 0 0 0; }
-
-.aa-mode-pill {
-    display: inline-flex; align-items: center; gap: 0.45rem; white-space: nowrap;
-    padding: 0.38rem 0.85rem; border-radius: var(--aa-radius-pill);
-    font-size: 0.8rem; font-weight: 600; border: 1px solid var(--aa-border);
-    background: var(--aa-surface); color: var(--aa-text-soft); box-shadow: var(--aa-shadow-sm);
-}
-.aa-mode-pill .aa-dot { width: 8px; height: 8px; border-radius: 50%; background: #94A3B8; }
-.aa-mode-pill.gemini { color: #1E40AF; border-color: #BFDBFE; background: var(--aa-primary-soft); }
-.aa-mode-pill.gemini .aa-dot { background: var(--aa-primary); }
-
-/* ---------- Metric cards ---------- */
-.aa-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.9rem; }
-@media (max-width: 900px) { .aa-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-.aa-metric {
-    background: var(--aa-surface); border: 1px solid var(--aa-border);
-    border-radius: var(--aa-radius-card); padding: 1rem 1.1rem; box-shadow: var(--aa-shadow-sm);
-    transition: transform var(--aa-t-fast) var(--aa-ease), box-shadow var(--aa-t-fast) var(--aa-ease),
-                border-color var(--aa-t-fast) var(--aa-ease);
-}
-.aa-metric:hover { transform: translateY(-2px); box-shadow: var(--aa-shadow-md); }
-.aa-metric .aa-value {
-    font-size: 1.55rem; font-weight: 700; letter-spacing: -0.02em; color: var(--aa-text);
-    margin-top: 0.3rem; line-height: 1.2; transition: color var(--aa-t-fast) ease;
-}
-.aa-metric .aa-sub { font-size: 0.8rem; color: var(--aa-text-muted); margin-top: 0.3rem; }
-.aa-metric.attention { border-color: #FCD34D; }
-.aa-metric.attention .aa-value { color: var(--aa-pending-fg); }
-
-/* ---------- Budget bar ---------- */
-.aa-budget {
-    background: var(--aa-surface); border: 1px solid var(--aa-border); border-radius: var(--aa-radius-card);
-    padding: 0.85rem 1.1rem; margin: 0.9rem 0 1.6rem 0; box-shadow: var(--aa-shadow-sm);
-}
-.aa-budget-row { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; margin-bottom: 0.55rem; }
-.aa-budget-row .aa-budget-text { font-size: 0.88rem; color: var(--aa-text-soft); }
-.aa-budget-row .aa-budget-text strong { color: var(--aa-text); }
-.aa-budget-row .aa-budget-pct { font-size: 0.85rem; font-weight: 700; }
-.aa-bar-track { height: 10px; background: var(--aa-bar-track); border-radius: var(--aa-radius-pill); overflow: hidden; }
-@keyframes aa-bar-grow { from { width: var(--aa-bar-from); } }
-.aa-bar-fill {
-    height: 100%; border-radius: var(--aa-radius-pill);
-    animation: aa-bar-grow 700ms var(--aa-ease) both;
-    transition: width 700ms var(--aa-ease), background-color 300ms ease;
-}
-.aa-bar-fill.ok { background: var(--aa-bar-ok); }
-.aa-bar-fill.warn { background: var(--aa-bar-warn); }
-.aa-bar-fill.danger { background: var(--aa-bar-danger); }
-.aa-budget-pct.ok { color: var(--aa-bar-ok); }
-.aa-budget-pct.warn { color: #B45309; }
-.aa-budget-pct.danger { color: var(--aa-blocked-fg); }
-
-/* ---------- Status pills ---------- */
-.aa-pill {
-    display: inline-flex; align-items: center; gap: 0.38rem; white-space: nowrap;
-    padding: 0.22rem 0.65rem; border-radius: var(--aa-radius-pill);
-    font-size: 0.74rem; font-weight: 600; letter-spacing: 0.02em; line-height: 1.4;
-    transition: background-color var(--aa-t-fast) ease, color var(--aa-t-fast) ease;
-}
-.aa-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.aa-pill.approved { color: var(--aa-approved-fg); background: var(--aa-approved-bg); }
-.aa-pill.pending  { color: var(--aa-pending-fg);  background: var(--aa-pending-bg); }
-.aa-pill.blocked  { color: var(--aa-blocked-fg);  background: var(--aa-blocked-bg); }
-.aa-pill.rejected { color: var(--aa-rejected-fg); background: var(--aa-rejected-bg); }
-.aa-pill.executed { color: var(--aa-executed-fg); background: var(--aa-executed-bg); }
-
-/* ---------- Cards (bordered st.container with key "aa-card-*") ---------- */
-[class*="st-key-aa-card"] {
-    background: var(--aa-surface) !important; border: 1px solid var(--aa-border) !important;
-    border-radius: var(--aa-radius-card) !important; box-shadow: var(--aa-shadow-sm);
-    padding: 1.1rem 1.2rem !important;
-    transition: transform var(--aa-t-fast) var(--aa-ease), box-shadow var(--aa-t-fast) var(--aa-ease);
-}
-[class*="st-key-aa-card"]:hover { transform: translateY(-2px); box-shadow: var(--aa-shadow-md); }
-[class*="st-key-aa-card-static"]:hover { transform: none; box-shadow: var(--aa-shadow-sm); }
-[class*="st-key-aa-card-decision-approved"], [class*="st-key-aa-card-pending"] { border-left-width: 4px !important; }
-[class*="st-key-aa-card-decision-approved"] { border-left: 4px solid var(--aa-approved-fg) !important; }
-[class*="st-key-aa-card-decision-executed"] { border-left: 4px solid var(--aa-executed-fg) !important; }
-[class*="st-key-aa-card-decision-pending"]  { border-left: 4px solid #F59E0B !important; }
-[class*="st-key-aa-card-decision-blocked"]  { border-left: 4px solid var(--aa-blocked-fg) !important; }
-[class*="st-key-aa-card-decision-none"]     { border-left: 4px solid #94A3B8 !important; }
-[class*="st-key-aa-card-pending"]           { border-left: 4px solid #F59E0B !important; }
-
-.aa-card-title { font-size: 1rem; font-weight: 700; color: var(--aa-text); margin: 0; }
-.stApp p.aa-card-desc { font-size: 0.86rem !important; color: var(--aa-text-muted); margin: 0.25rem 0 0.75rem 0; line-height: 1.45; }
-.stApp p.aa-reason, .stApp .aa-reasons li { font-size: 0.88rem !important; }
-.stApp .aa-header p.aa-tagline, .stApp .aa-section p, .stApp .aa-empty p { font-size: 0.92rem !important; }
-.aa-card-head { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
-.aa-icon-chip {
-    display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px;
-    border-radius: 10px; background: var(--aa-primary-soft); color: var(--aa-primary);
-    font-size: 1.05rem; font-weight: 700; margin-bottom: 0.6rem;
-}
-.aa-msym {
-    font-family: 'Material Symbols Rounded'; font-weight: normal; font-style: normal; font-size: 20px;
-    line-height: 1; letter-spacing: normal; text-transform: none; white-space: nowrap;
-    -webkit-font-feature-settings: 'liga'; font-feature-settings: 'liga'; -webkit-font-smoothing: antialiased;
-}
-.aa-empty .aa-msym { font-size: 26px; }
-/* Equal-height scenario cards with buttons pinned to the bottom */
-[data-testid="stHorizontalBlock"]:has([class*="st-key-aa-card-scn"]) > [data-testid="stColumn"] > div { height: 100%; }
-[class*="st-key-aa-card-scn"] { height: 100%; justify-content: space-between; }
-[class*="st-key-aa-card-scn"] [data-testid="stElementContainer"]:has(button) { margin-top: auto; }
-
-/* ---------- How it works strip ---------- */
-.aa-how {
-    display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 0.75rem;
-    background: var(--aa-surface); border: 1px solid var(--aa-border); border-radius: var(--aa-radius-card);
-    padding: 1.1rem 1.3rem; margin-bottom: 1.25rem; box-shadow: var(--aa-shadow-sm);
-}
-@media (max-width: 900px) { .aa-how { grid-template-columns: 1fr; } .aa-how .aa-arrow { display: none; } }
-.aa-how .aa-step { display: flex; gap: 0.75rem; align-items: flex-start; }
-.aa-how .aa-step-num {
-    flex: 0 0 28px; height: 28px; border-radius: 50%; background: var(--aa-primary-soft);
-    color: var(--aa-primary); font-weight: 700; font-size: 0.82rem;
-    display: flex; align-items: center; justify-content: center;
-}
-.aa-how .aa-step-title { font-weight: 700; font-size: 0.93rem; color: var(--aa-text); }
-.aa-how .aa-step-desc { font-size: 0.8rem; color: var(--aa-text-muted); line-height: 1.4; margin-top: 0.1rem; }
-.aa-how .aa-arrow { color: #94A3B8; font-size: 1.1rem; }
-
-/* ---------- Live agent steps ---------- */
-.aa-steps { display: flex; flex-direction: column; gap: 0.45rem; margin: 0.25rem 0 0.75rem 0; }
-.aa-steprow {
-    display: flex; align-items: center; gap: 0.6rem; font-size: 0.9rem; color: var(--aa-text-soft);
-    transition: color var(--aa-t-fast) ease, opacity var(--aa-t-fast) ease;
-}
-.aa-steprow .aa-ico {
-    width: 20px; height: 20px; border-radius: 50%; flex: 0 0 20px;
-    display: inline-flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700;
-}
-.aa-steprow.pending { color: var(--aa-placeholder); }
-.aa-steprow.pending .aa-ico { border: 2px solid var(--aa-border); }
-.aa-steprow.active { color: var(--aa-text); font-weight: 600; }
-.aa-steprow.active .aa-ico {
-    border: 2px solid var(--aa-primary-soft); border-top-color: var(--aa-primary);
-    animation: aa-spin 0.8s linear infinite;
-}
-.aa-steprow.done .aa-ico { background: var(--aa-primary-soft); color: var(--aa-primary); }
-.aa-steprow.skipped { color: var(--aa-placeholder); text-decoration: line-through; }
-.aa-steprow.skipped .aa-ico { background: var(--aa-border); color: var(--aa-text-muted); }
-.aa-steprow .aa-detail { color: var(--aa-text-muted); font-weight: 400; }
-@keyframes aa-spin { to { transform: rotate(360deg); } }
-
-/* ---------- Outcome banner ---------- */
-.aa-outcome { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 0.95rem; margin-bottom: 0.5rem; }
-.aa-outcome .aa-oico {
-    width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center;
-    justify-content: center; font-size: 0.75rem; color: #FFFFFF;
-}
-.aa-outcome.approved { color: var(--aa-approved-fg); } .aa-outcome.approved .aa-oico { background: var(--aa-approved-fg); }
-.aa-outcome.pending  { color: var(--aa-pending-fg); }  .aa-outcome.pending .aa-oico  { background: #F59E0B; }
-.aa-outcome.blocked  { color: var(--aa-blocked-fg); }  .aa-outcome.blocked .aa-oico  { background: var(--aa-blocked-fg); }
-.aa-outcome.none     { color: var(--aa-rejected-fg); } .aa-outcome.none .aa-oico     { background: #94A3B8; }
-.aa-outcome.error    { color: var(--aa-blocked-fg); }  .aa-outcome.error .aa-oico    { background: var(--aa-blocked-fg); }
-
-/* ---------- Decision / detail content ---------- */
-.aa-kv { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; margin: 0.85rem 0; }
-@media (max-width: 700px) { .aa-kv { grid-template-columns: 1fr; } }
-.aa-kv .aa-v { font-size: 0.98rem; font-weight: 600; color: var(--aa-text); margin-top: 0.15rem; overflow-wrap: anywhere; }
-.aa-kv .aa-v.big { font-size: 1.2rem; font-weight: 700; }
-.aa-reason { font-size: 0.88rem; color: var(--aa-text-soft); line-height: 1.5; margin: 0 0 0.6rem 0; overflow-wrap: anywhere; }
-.aa-reasons { margin: 0.35rem 0 0.75rem 0; padding-left: 1.1rem; }
-.aa-reasons li { font-size: 0.88rem; color: var(--aa-text-soft); line-height: 1.5; margin: 0.15rem 0; overflow-wrap: anywhere; }
-.aa-next {
-    display: flex; gap: 0.5rem; align-items: flex-start; background: var(--aa-surface-muted);
-    border: 1px solid var(--aa-border); border-radius: var(--aa-radius-input);
-    padding: 0.65rem 0.85rem; font-size: 0.87rem; color: var(--aa-text-soft); margin-bottom: 0.75rem;
-}
-.aa-next strong { color: var(--aa-text); white-space: nowrap; }
-.aa-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; overflow-wrap: anywhere; }
-
-/* ---------- Empty state ---------- */
-.aa-empty {
-    text-align: center; background: var(--aa-surface); border: 1px dashed var(--aa-input-border);
-    border-radius: var(--aa-radius-card); padding: 2.5rem 1.5rem; margin-bottom: 1rem;
-}
-.aa-empty .aa-empty-icon {
-    width: 52px; height: 52px; margin: 0 auto 0.75rem auto; border-radius: 50%;
-    background: var(--aa-approved-bg); color: var(--aa-approved-fg); font-size: 1.5rem;
-    display: flex; align-items: center; justify-content: center;
-}
-.aa-empty h3 { font-size: 1.1rem; font-weight: 700; color: var(--aa-text); margin: 0; padding: 0; }
-.aa-empty p { color: var(--aa-text-muted); font-size: 0.9rem; margin: 0.35rem 0 0 0; }
-
-/* ---------- Merchant chips / inline validation ---------- */
-.aa-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.35rem 0 0.25rem 0; }
-.aa-chip {
-    background: var(--aa-primary-soft); color: #1E40AF; border: 1px solid #BFDBFE;
-    border-radius: var(--aa-radius-pill); padding: 0.18rem 0.6rem; font-size: 0.78rem; font-weight: 500;
-}
-.aa-field-error { color: var(--aa-blocked-fg); font-size: 0.8rem; margin: -0.4rem 0 0.6rem 0; }
-.aa-field-hint  { color: var(--aa-pending-fg); font-size: 0.8rem; margin: -0.2rem 0 0.6rem 0; }
-.aa-dirty { color: var(--aa-pending-fg); font-size: 0.85rem; font-weight: 600; }
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    """Convert a #RRGGBB hex string into an (R, G, B) integer tuple."""
+    cleaned = hex_color.strip().lstrip("#")
+    if len(cleaned) == 3:
+        cleaned = "".join(ch * 2 for ch in cleaned)
+    if len(cleaned) != 6:
+        raise ValueError(f"Expected 6-digit hex color, got {hex_color!r}")
+    return int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16)
 
 
-/* ---------- Inputs (main area) ---------- */
-.stApp [data-baseweb="input"], .stApp [data-baseweb="base-input"], .stApp [data-baseweb="textarea"],
-.stApp [data-baseweb="select"] > div {
-    background-color: var(--aa-surface) !important; border-radius: var(--aa-radius-input) !important;
-}
-[data-testid="stMain"] [data-baseweb="input"], [data-testid="stMain"] [data-baseweb="textarea"],
-[data-testid="stMain"] [data-baseweb="select"] > div,
-div[role="dialog"] [data-baseweb="input"], div[role="dialog"] [data-baseweb="textarea"] {
-    border: 1px solid var(--aa-input-border) !important;
-    transition: border-color var(--aa-t-fast) ease, box-shadow var(--aa-t-fast) ease;
-}
-[data-testid="stMain"] [data-baseweb="input"]:focus-within,
-[data-testid="stMain"] [data-baseweb="textarea"]:focus-within,
-[data-testid="stMain"] [data-baseweb="select"] > div:focus-within {
-    border-color: var(--aa-primary) !important; box-shadow: 0 0 0 3px var(--aa-focus-ring) !important;
-}
-[data-testid="stMain"] input, [data-testid="stMain"] textarea {
-    color: var(--aa-text) !important; -webkit-text-fill-color: var(--aa-text) !important;
-    background-color: var(--aa-surface) !important; caret-color: var(--aa-primary);
-}
-[data-testid="stMain"] input::placeholder, [data-testid="stMain"] textarea::placeholder,
-[data-testid="stBottom"] textarea::placeholder {
-    color: var(--aa-placeholder) !important; -webkit-text-fill-color: var(--aa-placeholder) !important; opacity: 1;
-}
-[data-testid="stMain"] [data-testid="stNumberInputContainer"] button {
-    background: var(--aa-surface-muted) !important; color: var(--aa-text-soft) !important;
-}
-[data-testid="stMain"] [data-testid="stNumberInputContainer"] button:hover { background: var(--aa-border) !important; }
-[data-testid="stWidgetLabel"] p { color: var(--aa-text); font-weight: 600; font-size: 0.88rem; }
-
-/* Chat input (lives in stBottom) */
-[data-testid="stBottom"] > div, [data-testid="stBottomBlockContainer"] { background: var(--aa-bg) !important; }
-[data-testid="stChatInput"] {
-    background: var(--aa-surface) !important; border: 1px solid var(--aa-input-border) !important;
-    border-radius: var(--aa-radius-card) !important; box-shadow: var(--aa-shadow-sm);
-    transition: border-color var(--aa-t-fast) ease, box-shadow var(--aa-t-fast) ease;
-}
-[data-testid="stChatInput"]:focus-within {
-    border-color: var(--aa-primary) !important; box-shadow: 0 0 0 3px var(--aa-focus-ring) !important;
-}
-[data-testid="stChatInput"] > div, [data-testid="stChatInput"] [data-baseweb="textarea"],
-[data-testid="stChatInput"] [data-baseweb="base-input"] { background: transparent !important; border: none !important; }
-[data-testid="stChatInput"] textarea {
-    color: var(--aa-text) !important; -webkit-text-fill-color: var(--aa-text) !important; background: transparent !important;
-}
-[data-testid="stChatInputSubmitButton"] { color: var(--aa-primary) !important; }
-
-/* ---------- Buttons (main area + dialogs) ---------- */
-.stApp button[kind], .stApp a[data-testid^="stBaseLinkButton"] {
-    border-radius: var(--aa-radius-input) !important; font-weight: 600 !important;
-    transition: background-color var(--aa-t-fast) ease, border-color var(--aa-t-fast) ease,
-                color var(--aa-t-fast) ease, transform 100ms ease, box-shadow var(--aa-t-fast) ease !important;
-}
-.stApp button[kind]:active, .stApp a[data-testid^="stBaseLinkButton"]:active { transform: scale(0.98); }
-[data-testid="stMain"] button[kind^="primary"], div[role="dialog"] button[kind^="primary"],
-[data-testid="stMain"] a[data-testid="stBaseLinkButton-primary"] {
-    background: var(--aa-primary) !important; border: 1px solid var(--aa-primary) !important; color: #FFFFFF !important;
-    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.25);
-}
-[data-testid="stMain"] button[kind^="primary"]:hover, div[role="dialog"] button[kind^="primary"]:hover,
-[data-testid="stMain"] a[data-testid="stBaseLinkButton-primary"]:hover {
-    background: var(--aa-primary-hover) !important; border-color: var(--aa-primary-hover) !important;
-    box-shadow: 0 4px 10px rgba(37, 99, 235, 0.25);
-}
-[data-testid="stMain"] button[kind^="primary"] p, [data-testid="stMain"] a[data-testid="stBaseLinkButton-primary"] p,
-div[role="dialog"] button[kind^="primary"] p { color: #FFFFFF !important; }
-[data-testid="stMain"] button[kind^="secondary"], div[role="dialog"] button[kind^="secondary"],
-[data-testid="stMain"] a[data-testid="stBaseLinkButton-secondary"] {
-    background: var(--aa-surface) !important; border: 1px solid var(--aa-input-border) !important; color: var(--aa-text) !important;
-}
-[data-testid="stMain"] button[kind^="secondary"]:hover, div[role="dialog"] button[kind^="secondary"]:hover {
-    border-color: var(--aa-primary) !important; color: var(--aa-primary) !important; background: var(--aa-primary-soft) !important;
-}
-[data-testid="stMain"] button[kind^="secondary"]:hover p, div[role="dialog"] button[kind^="secondary"]:hover p { color: var(--aa-primary) !important; }
-[data-testid="stMain"] button[kind]:focus-visible { box-shadow: 0 0 0 3px var(--aa-focus-ring) !important; }
-button.aa-danger, .st-key-aa-confirm-reset button {
-    background: var(--aa-blocked-fg) !important; border-color: var(--aa-blocked-fg) !important; color: #FFFFFF !important;
-}
-.st-key-aa-confirm-reset button p { color: #FFFFFF !important; }
-.st-key-aa-confirm-reset button:hover { background: #991B1B !important; border-color: #991B1B !important; }
-
-/* Page links styled as subtle buttons */
-[data-testid="stMain"] [data-testid="stPageLink"] a {
-    border: 1px solid var(--aa-input-border); border-radius: var(--aa-radius-input); background: var(--aa-surface);
-    padding: 0.35rem 0.8rem; transition: border-color var(--aa-t-fast) ease, background-color var(--aa-t-fast) ease;
-}
-[data-testid="stMain"] [data-testid="stPageLink"] a:hover { border-color: var(--aa-primary); background: var(--aa-primary-soft); }
-[data-testid="stMain"] [data-testid="stPageLink"] a p { color: var(--aa-primary) !important; font-weight: 600; }
-
-/* ---------- Chat messages ---------- */
-[data-testid="stChatMessage"] { background: transparent; padding: 0.5rem 0; }
-[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p { color: var(--aa-text); line-height: 1.6; }
-[data-testid="stChatMessageAvatarUser"] { background: #E2E8F0 !important; color: var(--aa-text-soft) !important; }
-[data-testid="stChatMessageAvatarAssistant"] { background: var(--aa-primary) !important; color: #FFFFFF !important; }
-
-/* Inline code in main area: never a dark chip */
-[data-testid="stMain"] code { background: #F1F5F9 !important; color: var(--aa-text) !important; border-radius: 6px; }
-
-/* Toasts & dialogs */
-[data-testid="stToast"] {
-    background: var(--aa-surface) !important; color: var(--aa-text) !important;
-    border: 1px solid var(--aa-border); box-shadow: var(--aa-shadow-md); border-radius: var(--aa-radius-card) !important;
-}
-[data-testid="stToast"] p { color: var(--aa-text) !important; }
-div[role="dialog"] { border-radius: var(--aa-radius-card) !important; }
-
-/* ---------- Sidebar ---------- */
-section[data-testid="stSidebar"] { background: var(--aa-sidebar-bg) !important; border-right: 1px solid #1E293B; }
-section[data-testid="stSidebar"] [data-testid="stSidebarHeader"] { padding-top: 1.25rem; padding-bottom: 0.5rem; }
-section[data-testid="stSidebar"] [data-testid="stSidebarHeader"] img { max-width: 100%; }
-section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] span,
-section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] summary { color: var(--aa-sidebar-text); }
-section[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
-section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: var(--aa-sidebar-muted) !important; }
-section[data-testid="stSidebar"] hr { border-color: #1E293B !important; margin: 0.75rem 0; }
-section[data-testid="stSidebar"] [data-testid="stSidebarNavSeparator"] { border-color: #1E293B; }
-
-/* Nav links */
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"] {
-    position: relative; border-radius: 8px; margin: 1px 0; padding-left: 0.85rem;
-    transition: background-color var(--aa-t-fast) ease, color var(--aa-t-fast) ease;
-}
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"] span { color: #CBD5E1 !important; font-weight: 500; }
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"]:hover { background: rgba(148, 163, 184, 0.12) !important; }
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"]:hover span { color: #FFFFFF !important; }
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"][aria-current="page"] {
-    background: rgba(96, 165, 250, 0.16) !important;
-}
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"][aria-current="page"] span { color: #FFFFFF !important; font-weight: 600; }
-section[data-testid="stSidebar"] [data-testid="stSidebarNavLink"][aria-current="page"]::before {
-    content: ""; position: absolute; left: 0; top: 7px; bottom: 7px; width: 3px;
-    border-radius: 3px; background: var(--aa-sidebar-accent);
-}
-
-/* Sidebar expander (Demo tools) */
-section[data-testid="stSidebar"] [data-testid="stExpander"] details {
-    background: rgba(30, 41, 59, 0.6) !important; border: 1px solid var(--aa-sidebar-border) !important;
-    border-radius: var(--aa-radius-input) !important;
-}
-section[data-testid="stSidebar"] [data-testid="stExpander"] summary { color: var(--aa-sidebar-text) !important; }
-section[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover { background: rgba(148, 163, 184, 0.10) !important; }
-section[data-testid="stSidebar"] [data-testid="stExpander"] summary p { font-weight: 600; color: var(--aa-sidebar-text) !important; }
-section[data-testid="stSidebar"] [data-testid="stExpander"] summary svg { fill: var(--aa-sidebar-muted); color: var(--aa-sidebar-muted); }
-
-/* Sidebar buttons: always readable */
-section[data-testid="stSidebar"] button[kind] {
-    background: var(--aa-sidebar-surface) !important; border: 1px solid #475569 !important;
-    color: #F8FAFC !important; border-radius: var(--aa-radius-input) !important;
-    transition: background-color var(--aa-t-fast) ease, border-color var(--aa-t-fast) ease, transform 100ms ease !important;
-}
-section[data-testid="stSidebar"] button[kind] p { color: #F8FAFC !important; font-weight: 600; }
-section[data-testid="stSidebar"] button[kind]:hover {
-    background: var(--aa-sidebar-surface-hover) !important; border-color: var(--aa-sidebar-accent) !important;
-}
-section[data-testid="stSidebar"] button[kind]:active { transform: scale(0.98); }
-section[data-testid="stSidebar"] button[kind]:focus-visible { box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.4) !important; }
-section[data-testid="stSidebar"] .st-key-side_reset_btn button { border-color: #7F1D1D !important; }
-section[data-testid="stSidebar"] .st-key-side_reset_btn button:hover { background: #7F1D1D !important; border-color: #F87171 !important; }
-
-.aa-side-status {
-    display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--aa-sidebar-muted);
-    padding: 0.4rem 0.2rem;
-}
-.aa-side-status .aa-sdot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
-.aa-side-status .aa-sdot.ok { background: #22C55E; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2); }
-.aa-side-status .aa-sdot.warn { background: #F59E0B; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2); }
-.aa-side-alert {
-    background: #1E293B; border-left: 3px solid #F87171; border-radius: 8px;
-    padding: 0.7rem 0.8rem; margin-top: 0.6rem; font-size: 0.8rem; color: #CBD5E1;
-}
-.aa-side-alert .aa-side-alert-title { font-weight: 700; color: #FCA5A5; margin-bottom: 0.3rem; }
-.aa-side-label {
-    font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--aa-sidebar-muted); margin: 0.35rem 0 0.35rem 0.1rem;
-}
-
-/* ---------- Reduced motion ---------- */
-@media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after {
-        animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
-        transition-duration: 0.001ms !important;
-    }
-    [class*="st-key-aa-card"]:hover, .aa-metric:hover { transform: none !important; }
-}
-"""
+def relative_luminance(hex_color: str) -> float:
+    """Compute WCAG 2.1 relative luminance for a #RRGGBB hex color."""
+    r, g, b = _hex_to_rgb(hex_color)
+    channels = []
+    for channel in (r, g, b):
+        s = channel / 255.0
+        channels.append(s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
 
 
-def build_theme_css() -> str:
-    """Return the full <style> block with design tokens emitted as CSS variables."""
-    return f"<style>\n:root {{\n{_root_vars()}\n}}\n{_CSS_BODY}\n</style>"
-
-
-# Kept for backward compatibility with any importer of the old constant.
-THEME_CSS = build_theme_css()
-
-
-def inject_theme_css() -> None:
-    """Inject consolidated theme CSS into the Streamlit session."""
-    st.markdown(THEME_CSS, unsafe_allow_html=True)
+def contrast_ratio(fg_hex: str, bg_hex: str) -> float:
+    """Compute WCAG 2.1 contrast ratio (>= 1.0) between two #RRGGBB hex colors."""
+    lum1 = relative_luminance(fg_hex)
+    lum2 = relative_luminance(bg_hex)
+    brightest = max(lum1, lum2)
+    darkest = min(lum1, lum2)
+    return (brightest + 0.05) / (darkest + 0.05)
 
 
 # ==============================================================================
-# Escaping helpers ($ must never become LaTeX)
+# 3. ESCAPING, ICONS & FORMATTING HELPERS
 # ==============================================================================
-
-def md_escape(text: Any) -> str:
-    """Escape dollar signs for st.markdown so amounts never render as LaTeX."""
-    if text is None:
+def html_text(value: object) -> str:
+    """
+    HTML-escape any dynamic text before interpolating into `st.markdown(..., unsafe_allow_html=True)`,
+    and replace `$` with `&#36;` so Streamlit's Markdown renderer never pairs two dollar signs
+    into a LaTeX math span.
+    """
+    if value is None:
         return ""
-    s = str(text)
-    # Normalize already-escaped dollars first so we never double escape.
-    return s.replace("\\$", "$").replace("$", "\\$")
+    return _html.escape(str(value), quote=True).replace("$", "&#36;")
 
 
-def html_text(text: Any) -> str:
-    """HTML-escape text and neutralize '$' (as an entity) for use inside HTML markdown blocks."""
-    if text is None:
+def md_escape(value: object) -> str:
+    """Escape `$` in strings passed to native Streamlit markdown widgets (`st.caption`, `st.toast`, etc.)."""
+    if value is None:
         return ""
-    return html.escape(str(text)).replace("$", "&#36;")
+    return str(value).replace("$", r"\$")
 
 
-def money_html(amount: Any, currency: Optional[str] = None) -> str:
-    """Format a monetary amount for HTML blocks (LaTeX-safe)."""
+def money_html(amount: object, currency: object = "USD") -> str:
+    """
+    Format a numeric amount as HTML-safe `&#36;X.XX` (or `X.XX CUR` when non-USD).
+    If `amount` is non-numeric, escape both `amount` and `currency` safely.
+    """
+    cur = str(currency or "USD").strip()
     try:
-        value = f"{float(amount):,.2f}"
+        val = float(amount)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        value = html.escape(str(amount))
-    suffix = f" {html.escape(currency)}" if currency and currency.upper() != "USD" else ""
-    return f"&#36;{value}{suffix}"
+        return f"{html_text(amount)} {html_text(cur)}".strip()
+    if cur.upper() == "USD" or not cur:
+        return f"&#36;{val:,.2f}"
+    return f"{val:,.2f} {html_text(cur)}"
 
 
 def render_html(markup: str, container: Any = None) -> None:
-    """Render a trusted HTML snippet via st.markdown (on an optional container)."""
+    """Render an HTML snippet through `st.markdown(..., unsafe_allow_html=True)`."""
     target = container if container is not None else st
-    # Collapse indentation so markdown never treats lines as code blocks.
-    cleaned = "\n".join(line.strip() for line in markup.strip().splitlines())
-    target.markdown(cleaned, unsafe_allow_html=True)
+    target.markdown(markup, unsafe_allow_html=True)
 
 
-# ==============================================================================
-# Pills
-# ==============================================================================
-
-def get_status_pill_html(status: str) -> str:
-    """WCAG AA status pill (text on tinted background, no emoji)."""
-    s = (status or "").upper().strip()
-    meta = STATUS_META.get(s)
-    if meta:
-        return f'<span class="aa-pill {meta["cls"]}">{meta["label"]}</span>'
-    return f'<span class="aa-pill rejected">{html_text(s.replace("_", " ").title() or "Unknown")}</span>'
-
-
-def get_mode_pill_html() -> str:
-    """Single header mode pill: Mock or Gemini."""
-    provider = (Config.LLM_PROVIDER or "mock").lower()
-    if provider == "gemini":
-        model_name = (
-            Config.LLM_MODEL
-            if Config.LLM_MODEL and Config.LLM_MODEL != "mock-agent"
-            else "gemini-2.5-flash"
-        )
-        return (
-            f'<span class="aa-mode-pill gemini" title="Live LLM: {html_text(model_name)}">'
-            f'<span class="aa-dot"></span>Gemini · {html_text(model_name)}</span>'
-        )
-    return '<span class="aa-mode-pill mock" title="Deterministic offline agent"><span class="aa-dot"></span>Mock mode</span>'
-
-
-# ==============================================================================
-# Header, metrics, budget bar
-# ==============================================================================
-
-def render_header() -> None:
-    """Product header: name, tagline, single mode pill."""
-    render_html(
-        f"""
-        <div class="aa-header">
-            <div>
-                <h1>Agent Allowance</h1>
-                <p class="aa-tagline">An allowance for your AI agent</p>
-            </div>
-            <div>{get_mode_pill_html()}</div>
-        </div>
-        """
+def svg_icon(name: str, size: int = 16, stroke_width: float = 1.7) -> str:
+    """Return a clean inline SVG icon using `currentColor`."""
+    sw = f"{stroke_width:.1f}"
+    paths = {
+        "check": f'<path d="M5 10.5L8.5 14L15 6.5" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round"/>',
+        "hourglass": f'<circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="{sw}"/><path d="M10 6.5V10.3L12.5 11.8" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round"/>',
+        "shield-x": f'<path d="M10 3L16 5.6V10.4C16 14 13.4 16.9 10 18C6.6 16.9 4 14 4 10.4V5.6L10 3Z" stroke="currentColor" stroke-width="{sw}" stroke-linejoin="round"/><path d="M7.8 7.8L12.2 12.2M12.2 7.8L7.8 12.2" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round"/>',
+        "shield": f'<path d="M10 3L16 5.6V10.4C16 14 13.4 16.9 10 18C6.6 16.9 4 14 4 10.4V5.6L10 3Z" stroke="currentColor" stroke-width="{sw}" stroke-linejoin="round"/><path d="M7.5 10.3L9.3 12.1L12.8 8.4" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round"/>',
+        "package": f'<path d="M10 2.8L16.5 6.3V13.7L10 17.2L3.5 13.7V6.3L10 2.8Z" stroke="currentColor" stroke-width="{sw}" stroke-linejoin="round"/><path d="M3.7 6.5L10 10L16.3 6.5M10 10V17" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round"/>',
+        "wheat": f'<path d="M10 3.5V16.5M6.5 7C8 7 10 8.5 10 10.5C10 8.5 12 7 13.5 7M6.5 11C8 11 10 12.5 10 14.5C10 12.5 12 11 13.5 11" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round"/>',
+        "gift": f'<rect x="3.5" y="7.5" width="13" height="9" rx="1.5" stroke="currentColor" stroke-width="{sw}"/><path d="M2.8 7.5H17.2M10 5.5V16.5M10 7.5C8 7.5 6.8 6.4 6.8 5.2C6.8 4.2 7.7 3.5 8.6 3.5C9.6 3.5 10 5 10 7.5ZM10 7.5C12 7.5 13.2 6.4 13.2 5.2C13.2 4.2 12.3 3.5 11.4 3.5C10.4 3.5 10 5 10 7.5Z" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round"/>',
+        "wallet": f'<rect x="3" y="5" width="14" height="10" rx="2" stroke="currentColor" stroke-width="{sw}"/><path d="M13 10H15" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round"/>',
+        "store": f'<path d="M3.5 8.5V15.5H16.5V8.5M2.8 8.5L4.5 4.5H15.5L17.2 8.5H2.8Z" stroke="currentColor" stroke-width="{sw}" stroke-linejoin="round"/>',
+        "info": f'<circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="{sw}"/><path d="M10 9V13.2" stroke="currentColor" stroke-width="{sw}" stroke-linecap="round"/><circle cx="10" cy="6.6" r="0.9" fill="currentColor"/>',
+    }
+    inner = paths.get(name, paths["info"])
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 20 20" fill="none" '
+        f'xmlns="http://www.w3.org/2000/svg">{inner}</svg>'
     )
 
 
-def bar_level(pct: float) -> str:
-    """Return 'ok' | 'warn' | 'danger' for the given fraction of budget used."""
-    if pct > BAR_DANGER_AT:
+# ==============================================================================
+# 4. STATUS PILL METADATA & HTML
+# ==============================================================================
+STATUS_META = {
+    "APPROVED": {
+        "cls": "approved",
+        "label": "Approved",
+        "verdict_title": "Purchase approved",
+        "icon": svg_icon("check", 16, 1.8),
+        "pill_icon": '<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.3L5 8.8L9.5 3.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    },
+    "NEEDS_APPROVAL": {
+        "cls": "pending",
+        "label": "Needs approval",
+        "verdict_title": "Needs your approval",
+        "icon": svg_icon("hourglass", 16, 1.7),
+        "pill_icon": '<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="4.2" stroke="currentColor" stroke-width="1.4"/><path d="M6 3.8V6.2L7.6 7.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+    },
+    "BLOCKED": {
+        "cls": "blocked",
+        "label": "Blocked",
+        "verdict_title": "Blocked by policy",
+        "icon": svg_icon("shield-x", 16, 1.7),
+        "pill_icon": '<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M3.5 3.5L8.5 8.5M8.5 3.5L3.5 8.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+    },
+    "EXECUTED": {
+        "cls": "executed",
+        "label": "Executed",
+        "verdict_title": "Executed",
+        "icon": svg_icon("check", 16, 1.8),
+        "pill_icon": '<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2 6.3L4.4 8.8L8.8 3.8M6.5 8.8L10.5 3.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    },
+    "REJECTED": {
+        "cls": "rejected",
+        "label": "Rejected",
+        "verdict_title": "Proposal rejected",
+        "icon": '<svg width="16" height="16" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.7"/><path d="M7 10H13" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+        "pill_icon": '<svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M3.2 6H8.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+    },
+}
+
+
+def status_card_key(status: str) -> str:
+    """Map status string to semantic key ('approved', 'pending', 'blocked', 'rejected', 'executed')."""
+    key = (status or "").upper()
+    meta = STATUS_META.get(key)
+    return meta["cls"] if meta else "rejected"
+
+
+def get_status_pill_html(status: str) -> str:
+    """Return a muted semantic status pill with small icon and text."""
+    key = (status or "").upper()
+    meta = STATUS_META.get(key)
+    if not meta:
+        fallback = str(status or "Unknown").replace("_", " ").title()
+        return f'<span class="aa-pill rejected aa-pill-rejected">{html_text(fallback)}</span>'
+    cls = meta["cls"]
+    return (
+        f'<span class="aa-pill {cls} aa-pill-{cls}">'
+        f'{meta["pill_icon"]}<span>{meta["label"]}</span></span>'
+    )
+
+
+# ==============================================================================
+# 5. SUMMARY BAR THRESHOLD HELPERS
+# ==============================================================================
+def gauge_level(pct: float | None) -> str:
+    """
+    Classify budget usage ratio (0.0..1.0+) into 'ok' (<75%), 'warn' (75%..90%),
+    or 'danger' (>90%).
+    """
+    try:
+        val = float(pct or 0.0)
+    except (TypeError, ValueError):
+        val = 0.0
+    if val > 0.90:
         return "danger"
-    if pct > BAR_WARN_AT:
+    if val >= 0.75:
         return "warn"
     return "ok"
 
 
-def get_budget_bar_html(spent: Any, budget: Any, pct: float, from_pct: Optional[float] = None) -> str:
-    """Custom budget bar: light track, blue fill, amber > 75%, red > 90%, animated width."""
-    pct = max(0.0, min(float(pct or 0.0), 1.0))
-    start = pct if from_pct is None else max(0.0, min(float(from_pct), 1.0))
-    level = bar_level(pct)
-    return f"""
-        <div class="aa-budget" role="group" aria-label="Monthly allowance usage">
-            <div class="aa-budget-row">
-                <span class="aa-budget-text">Monthly allowance used: <strong>{money_html(spent)}</strong> of {money_html(budget)}</span>
-                <span class="aa-budget-pct {level}">{pct * 100:.1f}%</span>
-            </div>
-            <div class="aa-bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{pct * 100:.1f}">
-                <div class="aa-bar-fill {level}" style="width: {pct * 100:.2f}%; --aa-bar-from: {start * 100:.2f}%;"></div>
-            </div>
-        </div>
-    """
+def gauge_color(pct: float | None) -> str:
+    """Return the hex color token for the budget bar fill based on usage ratio."""
+    lvl = gauge_level(pct)
+    if lvl == "danger":
+        return TOKENS["gauge-danger"]
+    if lvl == "warn":
+        return TOKENS["gauge-warn"]
+    return TOKENS["gauge-ok"]
 
 
-def render_metrics_banner(db_path: Optional[str] = None) -> None:
-    """Four metric cards plus the custom budget bar, on every page."""
-    metrics = get_dashboard_metrics(db_path=db_path)
-    approved_spend = metrics["approved_spend"]
-    monthly_budget = metrics["monthly_budget"]
-    budget_remaining = metrics["budget_remaining"]
-    budget_used_pct = float(metrics["budget_used_pct"])
-    pending_count = metrics["pending_count"]
-    blocked_count = metrics["blocked_count"]
-
-    pending_cls = " attention" if pending_count > 0 else ""
-    pending_sub = "Awaiting your review" if pending_count > 0 else "All cleared"
-
-    render_html(
-        f"""
-        <div class="aa-metrics">
-            <div class="aa-metric">
-                <div class="aa-label">Approved spend this month</div>
-                <div class="aa-value">{money_html(approved_spend)}</div>
-                <div class="aa-sub">{budget_used_pct * 100:.1f}% of monthly budget</div>
-            </div>
-            <div class="aa-metric">
-                <div class="aa-label">Budget remaining</div>
-                <div class="aa-value">{money_html(budget_remaining)}</div>
-                <div class="aa-sub">Monthly cap {money_html(monthly_budget)}</div>
-            </div>
-            <div class="aa-metric{pending_cls}">
-                <div class="aa-label">Pending approvals</div>
-                <div class="aa-value">{pending_count}</div>
-                <div class="aa-sub">{pending_sub}</div>
-            </div>
-            <div class="aa-metric">
-                <div class="aa-label">Blocked this month</div>
-                <div class="aa-value">{blocked_count}</div>
-                <div class="aa-sub">Stopped by policy rules</div>
-            </div>
-        </div>
-        """
-    )
-
-    prev = st.session_state.get("_aa_prev_budget_pct")
-    render_html(get_budget_bar_html(approved_spend, monthly_budget, budget_used_pct, from_pct=prev if prev is not None else 0.0))
-    st.session_state["_aa_prev_budget_pct"] = budget_used_pct
-
-
-def render_section_title(title: str, subtitle: str = "") -> None:
-    """Page section heading (h2) with optional muted subtitle."""
-    sub = f"<p>{html_text(subtitle)}</p>" if subtitle else ""
-    render_html(f'<div class="aa-section"><h2>{html_text(title)}</h2>{sub}</div>')
-
-
-# ==============================================================================
-# Chat components
-# ==============================================================================
-
-def render_how_it_works_strip() -> None:
-    """Empty-state strip: Agent proposes -> Rules decide -> PayPal pays."""
-    render_html(
-        """
-        <div class="aa-how" aria-label="How it works">
-            <div class="aa-step"><div class="aa-step-num">1</div><div>
-                <div class="aa-step-title">Agent proposes</div>
-                <div class="aa-step-desc">Searches the verified catalog and proposes one purchase.</div></div></div>
-            <div class="aa-arrow">&rarr;</div>
-            <div class="aa-step"><div class="aa-step-num">2</div><div>
-                <div class="aa-step-title">Rules decide</div>
-                <div class="aa-step-desc">Deterministic Python checks caps, budget and allowed merchants.</div></div></div>
-            <div class="aa-arrow">&rarr;</div>
-            <div class="aa-step"><div class="aa-step-num">3</div><div>
-                <div class="aa-step-title">PayPal pays</div>
-                <div class="aa-step-desc">A sandbox order is created only for approved purchases.</div></div></div>
-        </div>
-        """
+def get_ring_gauge_svg(pct: float, size: int = 44) -> str:
+    """Compact neutral ring SVG helper kept for backward compatibility."""
+    clamped = max(0.0, min(float(pct or 0.0), 1.0))
+    stroke = gauge_color(pct)
+    r = 16
+    c = 2 * 3.14159265 * r
+    offset = c * (1.0 - clamped)
+    pct_label = int(round(max(0.0, float(pct or 0.0)) * 100))
+    return (
+        f'<svg class="aa-ring-svg" width="{size}" height="{size}" viewBox="0 0 40 40" '
+        f'role="img" aria-label="Budget used {pct_label}%">'
+        f'<circle cx="20" cy="20" r="{r}" fill="none" stroke="{TOKENS["gauge-track"]}" stroke-width="3.5"/>'
+        f'<circle cx="20" cy="20" r="{r}" fill="none" stroke="{stroke}" stroke-width="3.5" '
+        f'stroke-linecap="round" stroke-dasharray="{c:.2f}" stroke-dashoffset="{offset:.2f}" '
+        f'transform="rotate(-90 20 20)"/>'
+        f'<text x="20" y="23.5" text-anchor="middle" fill="{TOKENS["ink"]}" '
+        f'font-size="9.5" font-weight="500">{pct_label}%</text>'
+        f"</svg>"
     )
 
 
-LIVE_STEPS = [
-    ("search", "Searching catalog"),
-    ("propose", "Proposing purchase"),
-    ("policy", "Checking policy"),
-]
-
-_STEP_ICON = {"pending": "", "active": "", "done": "&#10003;", "skipped": "&ndash;"}
-
-
-def get_live_steps_html(states: Dict[str, str], details: Optional[Dict[str, str]] = None) -> str:
-    """Render the three agent steps. states: step_id -> pending|active|done|skipped."""
-    details = details or {}
-    rows: List[str] = []
-    for step_id, label in LIVE_STEPS:
-        state = states.get(step_id, "pending")
-        detail = details.get(step_id)
-        detail_html = f' <span class="aa-detail">· {html_text(detail)}</span>' if detail else ""
-        rows.append(
-            f'<div class="aa-steprow {state}"><span class="aa-ico">{_STEP_ICON[state]}</span>'
-            f"<span>{label}{detail_html}</span></div>"
-        )
-    return f'<div class="aa-steps">{"".join(rows)}</div>'
-
-
-# outcome label -> (css class, icon glyph)
-_OUTCOME_STYLE = {
-    "Purchase approved": ("approved", "&#10003;"),
-    "Needs your approval": ("pending", "!"),
-    "Blocked by policy": ("blocked", "&#10005;"),
-    "No purchase proposed": ("none", "&ndash;"),
-    "Agent error": ("error", "!"),
+# ==============================================================================
+# 6. PIPELINE STRIP (Agent -> Rules -> PayPal)
+# ==============================================================================
+_PIPELINE_ICONS = {
+    "agent": (
+        '<svg width="14" height="14" viewBox="0 0 20 20" fill="none">'
+        '<rect x="3.5" y="5.5" width="13" height="10" rx="2.5" stroke="currentColor" stroke-width="1.6"/>'
+        '<circle cx="7.8" cy="10.5" r="1.1" fill="currentColor"/>'
+        '<circle cx="12.2" cy="10.5" r="1.1" fill="currentColor"/>'
+        '<path d="M10 3V5.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>'
+        "</svg>"
+    ),
+    "rules": (
+        '<svg width="14" height="14" viewBox="0 0 20 20" fill="none">'
+        '<path d="M10 2.8L16 5.3V10C16 13.7 13.5 16.5 10 17.6C6.5 16.5 4 13.7 4 10V5.3L10 2.8Z" '
+        'stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>'
+        '<path d="M7.5 10.2L9.3 12L12.8 8.3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+        "</svg>"
+    ),
+    "paypal": (
+        '<svg width="14" height="14" viewBox="0 0 20 20" fill="none">'
+        '<rect x="2.5" y="4.5" width="15" height="11" rx="2" stroke="currentColor" stroke-width="1.6"/>'
+        '<path d="M2.5 8.2H17.5" stroke="currentColor" stroke-width="1.6"/>'
+        '<path d="M5.5 12.2H9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>'
+        "</svg>"
+    ),
 }
 
 
-def get_outcome_html(label: str, state: str) -> str:
-    """Outcome line. A green check is shown only when state == 'complete' (real approval)."""
-    cls, icon = _OUTCOME_STYLE.get(label, ("none", "&ndash;"))
-    if state != "complete" and cls == "approved":  # defensive: never a check without approval
-        cls, icon = "none", "&ndash;"
-    return f'<div class="aa-outcome {cls}"><span class="aa-oico">{icon}</span>{html_text(label)}</div>'
+def pipeline_states(
+    phase: str,
+    status: str | None = None,
+    has_order: bool = False,
+) -> dict[str, tuple[str, str]]:
+    """
+    Compute `(visual_state, caption)` for each node of the Agent -> Rules -> PayPal
+    pipeline strip.
 
-
-def status_card_key(status: str) -> str:
-    """Map a decision status to the decision card key suffix (controls the left border color)."""
+    Security invariant: when `status` is `BLOCKED` or `NEEDS_APPROVAL`, the PayPal
+    node is ALWAYS `("dark", "Not contacted")`.
+    """
+    st_upper = (status or "").upper()
+    if phase == "searching":
+        return {
+            "agent": ("active", "Searching catalog..."),
+            "rules": ("idle", "Waiting"),
+            "paypal": ("idle", "Standby"),
+        }
+    if phase == "proposing":
+        return {
+            "agent": ("active", "Drafting proposal..."),
+            "rules": ("idle", "Waiting"),
+            "paypal": ("idle", "Standby"),
+        }
+    if phase == "checking":
+        return {
+            "agent": ("done", "Proposal drafted"),
+            "rules": ("active", "Checking rules..."),
+            "paypal": ("idle", "Standby"),
+        }
+    if phase == "ordering":
+        return {
+            "agent": ("done", "Proposal drafted"),
+            "rules": ("approved", "Approved"),
+            "paypal": ("active", "Creating order..."),
+        }
+    if phase == "decided":
+        if st_upper in ("APPROVED", "EXECUTED"):
+            pp_state = ("approved", "Order created") if has_order else ("dark", "No order ID")
+            rule_lbl = "Executed" if st_upper == "EXECUTED" else "Approved"
+            return {
+                "agent": ("done", "Proposed"),
+                "rules": ("approved", rule_lbl),
+                "paypal": pp_state,
+            }
+        if st_upper == "NEEDS_APPROVAL":
+            return {
+                "agent": ("done", "Proposed"),
+                "rules": ("pending", "Needs approval"),
+                "paypal": ("dark", "Not contacted"),
+            }
+        if st_upper == "BLOCKED":
+            return {
+                "agent": ("done", "Proposed"),
+                "rules": ("blocked", "Blocked"),
+                "paypal": ("dark", "Not contacted"),
+            }
+    if phase == "no_proposal":
+        return {
+            "agent": ("done", "Answered"),
+            "rules": ("idle", "No purchase"),
+            "paypal": ("dark", "Not contacted"),
+        }
+    if phase == "error":
+        return {
+            "agent": ("error", "Stopped"),
+            "rules": ("idle", "Skipped"),
+            "paypal": ("dark", "Not contacted"),
+        }
     return {
-        "APPROVED": "approved",
-        "EXECUTED": "executed",
-        "NEEDS_APPROVAL": "pending",
-        "BLOCKED": "blocked",
-    }.get((status or "").upper(), "none")
+        "agent": ("idle", "Proposes"),
+        "rules": ("idle", "Enforces limits"),
+        "paypal": ("idle", "Only if approved"),
+    }
 
 
-def get_decision_body_html(
-    status: str,
-    merchant: str,
-    amount: Any,
-    currency: str,
-    category: str,
-    reason: str,
-    policy_reasons: Iterable[str],
-    next_step: str,
+def get_pipeline_html(
+    states_or_phase: dict[str, tuple[str, str]] | str = "idle",
+    agent_detail: str = "",
+    compact: bool = False,
+    status: str | None = None,
+    has_order: bool = False,
 ) -> str:
-    """Decision card content (rendered inside a keyed bordered container)."""
-    reasons_html = "".join(f"<li>{html_text(r)}</li>" for r in policy_reasons if r)
-    reasons_block = (
-        f'<div class="aa-label" style="margin-top:0.25rem;">Why</div><ul class="aa-reasons">{reasons_html}</ul>'
-        if reasons_html
-        else ""
-    )
-    reason_block = (
-        f'<div class="aa-label">Agent&#39;s reason</div><p class="aa-reason">{html_text(reason)}</p>'
-        if reason
-        else ""
-    )
-    return f"""
-        <div class="aa-card-head">
-            <div class="aa-card-title">Policy decision</div>
-            {get_status_pill_html(status)}
-        </div>
-        <div class="aa-kv">
-            <div><div class="aa-label">Merchant</div><div class="aa-v">{html_text(merchant)}</div></div>
-            <div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(amount, currency)}</div></div>
-            <div><div class="aa-label">Category</div><div class="aa-v">{html_text(category)}</div></div>
-        </div>
-        {reason_block}
-        {reasons_block}
-        <div class="aa-next"><strong>What happens next:</strong><span>{html_text(next_step)}</span></div>
     """
-
-
-def get_empty_state_html(title: str, body: str, icon: str = "&#10003;") -> str:
-    return f"""
-        <div class="aa-empty">
-            <div class="aa-empty-icon">{icon}</div>
-            <h3>{html_text(title)}</h3>
-            <p>{html_text(body)}</p>
-        </div>
+    Render the slim white 3-node pipeline strip (`Agent` -> `Rules` -> `PayPal`)
+    joined by thin lines, with 24px icon tiles.
     """
+    if isinstance(states_or_phase, dict):
+        states = dict(states_or_phase)
+    else:
+        states = pipeline_states(str(states_or_phase), status=status, has_order=has_order)
+
+    spec = [
+        ("agent", "Agent"),
+        ("rules", "Rules"),
+        ("paypal", "PayPal"),
+    ]
+    parts: list[str] = []
+    for idx, (key, title) in enumerate(spec):
+        vstate, caption = states.get(key, ("idle", ""))
+        if key == "agent" and agent_detail:
+            caption = f"{caption} · {agent_detail}" if caption else agent_detail
+        safe_cap = html_text(caption)
+        node_html = (
+            f'<div class="aa-pipe-node aa-pipe-{html_text(vstate)}">'
+            f'<div class="aa-pipe-tile">{_PIPELINE_ICONS[key]}</div>'
+            f'<div class="aa-pipe-meta">'
+            f'<span class="aa-pipe-title">{title}</span>'
+            f'<span class="aa-pipe-sub">{safe_cap}</span>'
+            f"</div>"
+            f"</div>"
+        )
+        parts.append(node_html)
+        if idx < len(spec) - 1:
+            next_state = states.get(spec[idx + 1][0], ("idle", ""))[0]
+            conn_cls = "aa-pipe-conn"
+            if next_state in ("done", "approved"):
+                conn_cls += " aa-pipe-conn-lit"
+            elif next_state == "active":
+                conn_cls += " aa-pipe-conn-active"
+            elif next_state == "dark":
+                conn_cls += " aa-pipe-conn-dashed"
+            parts.append(f'<div class="{conn_cls}"></div>')
+
+    return f'<div class="aa-pipeline-strip">{"".join(parts)}</div>'
 
 
 # ==============================================================================
-# AG Grid (Ledger) theme
+# 7. DECISION CARD (Unified anatomy for Chat & Approvals)
 # ==============================================================================
-# The grid renders inside the component's iframe, so the page CSS above does not
-# reach it. These helpers feed the same TOKENS to AG Grid's theming params and to
-# the component's `custom_css` (injected into the iframe).
+_INFO_ICON_SVG = (
+    '<svg width="14" height="14" viewBox="0 0 16 16" fill="none">'
+    '<circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.3"/>'
+    '<path d="M8 7.2V11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>'
+    '<circle cx="8" cy="5" r="0.8" fill="currentColor"/>'
+    "</svg>"
+)
 
-def get_aggrid_theme_params() -> Dict[str, Any]:
-    """AG Grid (v34 Quartz) theme params matching the light app theme."""
+
+def get_verdict_html(
+    result: dict[str, Any] | None = None,
+    *,
+    status: str = "BLOCKED",
+    title: str = "",
+    merchant: str = "",
+    amount: Any = 0.0,
+    currency: str = "USD",
+    category: str = "",
+    reason: str = "",
+    policy_reasons: list[str] | None = None,
+    next_step: str = "",
+    subtitle: str = "Decided by rules, not the agent",
+    order_id: str | None = None,
+) -> str:
+    """
+    Build the v4 Decision Card HTML (`approved`, `needs approval`, `blocked`, `executed`, `rejected`):
+    - White card with 1px hairline border (#E7E5E4), 10px radius, overflow hidden
+    - 3px inner left status accent bar so corners stay clean
+    - Header row: 28px tinted icon tile, title + subtitle ("Decided by rules, not the agent"),
+      and muted status pill on the right
+    - Below #F0EFED divider: merchant name and category on left, 20px tabular amount on right
+    - Plain-English reasons list, each with a small colored status dot
+    - Muted line with info icon: "What happens next: ..." (with 12px space before buttons)
+    """
+    if isinstance(result, dict):
+        status = str(result.get("status") or status).upper()
+        merchant = str(result.get("merchant") or merchant or "Unknown merchant")
+        amount = result.get("amount", amount)
+        currency = str(result.get("currency") or currency or "USD")
+        category = str(result.get("category") or category or "General")
+        reason = str(result.get("reason") or reason or "")
+        raw_r = result.get("reasons")
+        if isinstance(raw_r, list):
+            policy_reasons = [str(r) for r in raw_r]
+        order_id = result.get("paypal_order_id") or order_id
+
+    st_upper = (status or "BLOCKED").upper()
+    meta = STATUS_META.get(st_upper, STATUS_META["BLOCKED"])
+    cls = meta["cls"]
+
+    card_title = html_text(title or meta["verdict_title"])
+    card_sub = html_text(subtitle or "Decided by rules, not the agent")
+    safe_merchant = html_text(merchant or "Unknown merchant")
+    safe_cat = html_text(category or "General")
+    amount_str = money_html(amount, currency=currency)
+
+    reasons_list: list[str] = []
+    if policy_reasons:
+        reasons_list.extend(str(r) for r in policy_reasons if str(r).strip())
+    if reason and str(reason).strip() and str(reason).strip() not in reasons_list:
+        reasons_list.append(str(reason).strip())
+    if not reasons_list:
+        reasons_list = ["Evaluated against active policy rules."]
+
+    reasons_items = "".join(
+        f'<li><span class="aa-reason-dot aa-dot-{cls}"></span><span>{html_text(r)}</span></li>'
+        for r in reasons_list
+    )
+
+    order_html = ""
+    if order_id:
+        order_html = (
+            f'<div class="aa-verdict-order-meta">'
+            f'Sandbox order <code class="aa-mono">{html_text(order_id)}</code>'
+            f"</div>"
+        )
+
+    safe_next = html_text(next_step or "Recorded in the audit ledger.")
+    pill_html = get_status_pill_html(st_upper)
+
+    return (
+        f'<div class="aa-decision-card aa-decision-{cls} aa-verdict-{cls} aa-needs-you">'
+        f'<div class="aa-decision-accent aa-accent-{cls}"></div>'
+        f'<div class="aa-decision-inner">'
+        f'<div class="aa-decision-head">'
+        f'<div class="aa-decision-head-left">'
+        f'<div class="aa-decision-icon aa-icon-{cls}">{meta["icon"]}</div>'
+        f"<div>"
+        f'<div class="aa-decision-title">{card_title}</div>'
+        f'<div class="aa-decision-sub">{card_sub}</div>'
+        f"</div>"
+        f"</div>"
+        f'<div class="aa-decision-head-right">{pill_html}</div>'
+        f"</div>"
+        f'<div class="aa-decision-divider"></div>'
+        f'<div class="aa-decision-deal">'
+        f'<div class="aa-decision-merchant-wrap">'
+        f'<span class="aa-decision-merchant">{safe_merchant}</span>'
+        f'<span class="aa-decision-cat">{safe_cat}</span>'
+        f"</div>"
+        f'<div class="aa-decision-amount">{amount_str}</div>'
+        f"</div>"
+        f'<ul class="aa-verdict-reasons">{reasons_items}</ul>'
+        f"{order_html}"
+        f'<div class="aa-decision-next">'
+        f'<span class="aa-decision-next-icon">{_INFO_ICON_SVG}</span>'
+        f'<span><strong>What happens next:</strong> {safe_next}</span>'
+        f"</div>"
+        f"</div>"
+        f"</div>"
+    )
+
+
+# ==============================================================================
+# 8. NEUTRAL EMPTY-STATE ILLUSTRATIONS (Greys & Ink with subtle muted accent)
+# ==============================================================================
+WELCOME_ILLUSTRATION = """
+<svg width="64" height="48" viewBox="0 0 72 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="8" y="6" width="56" height="44" rx="8" fill="#FFFFFF" stroke="#E7E5E4" stroke-width="1.2"/>
+  <rect x="15" y="13" width="22" height="4" rx="2" fill="#D6D3D1"/>
+  <rect x="15" y="21" width="34" height="3" rx="1.5" fill="#E7E5E4"/>
+  <rect x="15" y="28" width="28" height="3" rx="1.5" fill="#E7E5E4"/>
+  <rect x="44" y="33" width="14" height="11" rx="4" fill="#F5F5F4" stroke="#D6D3D1"/>
+  <path d="M51 35.5L54.2 36.8V39.6C54.2 41.5 52.8 43.1 51 43.7C49.2 43.1 47.8 41.5 47.8 39.6V36.8L51 35.5Z" stroke="#1C1917" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>
+"""
+
+APPROVALS_EMPTY_ILLUSTRATION = """
+<svg width="64" height="48" viewBox="0 0 72 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="12" y="7" width="48" height="42" rx="8" fill="#FFFFFF" stroke="#E7E5E4" stroke-width="1.2"/>
+  <circle cx="36" cy="25" r="10" fill="#EEF5EF" stroke="#CFE3D3" stroke-width="1.2"/>
+  <path d="M31.8 25.2L34.7 28.1L40.5 22.3" stroke="#2F6B3E" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="24" y="40" width="24" height="3" rx="1.5" fill="#E7E5E4"/>
+</svg>
+"""
+
+LEDGER_EMPTY_ILLUSTRATION = """
+<svg width="64" height="48" viewBox="0 0 72 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="10" y="7" width="52" height="42" rx="8" fill="#FFFFFF" stroke="#E7E5E4" stroke-width="1.2"/>
+  <line x1="10" y1="18" x2="62" y2="18" stroke="#E7E5E4" stroke-width="1.2"/>
+  <rect x="17" y="24" width="22" height="3.5" rx="1.75" fill="#D6D3D1"/>
+  <rect x="45" y="24" width="10" height="3.5" rx="1.75" fill="#E7E5E4"/>
+  <rect x="17" y="33" width="28" height="3.5" rx="1.75" fill="#E7E5E4"/>
+  <rect x="48" y="33" width="7" height="3.5" rx="1.75" fill="#E7E5E4"/>
+</svg>
+"""
+
+
+def get_welcome_html() -> str:
+    """Small neutral illustration and one line of copy for the Chat empty state."""
+    return (
+        f'<div class="aa-empty-state">'
+        f'<div class="aa-empty-illus">{WELCOME_ILLUSTRATION}</div>'
+        f'<div class="aa-empty-sub">Ask the agent to buy supplies, test an over-threshold request, or try a prompt injection.</div>'
+        f"</div>"
+    )
+
+
+def get_empty_state_html(
+    title: str,
+    subtitle: str,
+    illustration: str = WELCOME_ILLUSTRATION,
+) -> str:
+    """Render a quiet, centered empty-state block with neutral SVG illustration."""
+    return (
+        f'<div class="aa-empty-state">'
+        f'<div class="aa-empty-illus">{illustration}</div>'
+        f'<div class="aa-empty-title">{html_text(title)}</div>'
+        f'<div class="aa-empty-sub">{html_text(subtitle)}</div>'
+        f"</div>"
+    )
+
+
+# ==============================================================================
+# 9. PAGE HEADER, MODE PILL & SIDEBAR METER
+# ==============================================================================
+def get_mode_pill_html(
+    mode: str = "mock",
+    note: str | None = None,
+    mode_note: str | None = None,
+) -> str:
+    """Render a single neutral mode pill ('Mock mode' or 'Gemini live')."""
+    is_live = (mode or "").lower() in ("live", "gemini")
+    dot_cls = "aa-mode-dot-live" if is_live else "aa-mode-dot-mock"
+    label = "Gemini live" if is_live else "Mock mode"
+    final_note = note if note is not None else mode_note
+    note_span = f' <span class="aa-mode-note">· {html_text(final_note)}</span>' if final_note else ""
+    return (
+        f'<span class="aa-mode-pill">'
+        f'<span class="aa-mode-dot {dot_cls}"></span>'
+        f"<span>{label}</span>"
+        f"{note_span}"
+        f"</span>"
+    )
+
+
+def get_side_meter_html(remaining: int, cap: int) -> str:
+    """Sidebar 'Gemini requests left' with a neutral ink progress bar."""
+    rem = max(0, int(remaining))
+    total = max(1, int(cap))
+    pct = max(0.0, min((rem / total) * 100.0, 100.0))
+    return (
+        f'<div class="aa-sidebar-quota">'
+        f'<div class="aa-sidebar-quota-row">'
+        f"<span>Gemini requests left</span>"
+        f'<span class="aa-sidebar-quota-val">{rem} / {total}</span>'
+        f"</div>"
+        f'<div class="aa-sidebar-quota-track">'
+        f'<div class="aa-sidebar-quota-fill" style="width:{pct:.1f}%;"></div>'
+        f"</div>"
+        f"</div>"
+    )
+
+
+def get_quota_notice_html(notice: str) -> str:
+    """Render a quiet inline notice when Gemini falls back to Mock mode."""
+    return (
+        f'<div class="aa-quota-banner">'
+        f'<span class="aa-quota-dot"></span>'
+        f"<span>{html_text(notice)}</span>"
+        f"</div>"
+    )
+
+
+def get_page_header_html(
+    page_title: str,
+    mode: str = "mock",
+    note: str | None = None,
+) -> str:
+    """
+    Single-row page header: 22px page title on the left and one neutral
+    'Mock mode' or 'Gemini live' pill on the right. No hero banner.
+    """
+    pill = get_mode_pill_html(mode, note=note)
+    return (
+        f'<div class="aa-page-header">'
+        f'<h1 class="aa-page-title">{html_text(page_title)}</h1>'
+        f'<div class="aa-page-header-right">{pill}</div>'
+        f"</div>"
+    )
+
+
+def render_header(
+    mode: str = "mock",
+    mode_note: str | None = None,
+    show_tagline: bool = False,
+    page_title: str = "Chat",
+) -> None:
+    """Render the single-row v4 page header."""
+    st.markdown(
+        get_page_header_html(page_title=page_title, mode=mode, note=mode_note),
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_title(title: str, subtitle: str = "") -> None:
+    """Render a quiet subtitle line below the summary strip (page title is already in the header)."""
+    if subtitle:
+        st.markdown(
+            f'<div class="aa-section-sub">{html_text(subtitle)}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ==============================================================================
+# 10. SUMMARY STRIP ON EVERY PAGE
+# ==============================================================================
+def get_summary_strip_html(metrics: dict) -> str:
+    """
+    Render the single-row white summary strip used on EVERY page:
+    - "Spent $X / $Y" with a thin 4px bar (ink fill, amber above 75%, red above 90%)
+    - "Pending N" with a small status dot
+    - "Blocked N" with a small status dot
+    Wraps cleanly on narrow widths.
+    """
+    spent = float(metrics.get("approved_spend", Decimal("0.00")))
+    budget = float(metrics.get("monthly_budget", Decimal("200.00")))
+    pct = float(metrics.get("budget_used_pct", 0.0))
+    pending = int(metrics.get("pending_count", 0))
+    blocked = int(metrics.get("blocked_count", 0))
+
+    bar_color = gauge_color(pct)
+    bar_width = max(0.0, min(pct * 100.0, 100.0))
+
+    pending_dot_cls = "aa-dot-pending" if pending > 0 else "aa-dot-rejected"
+    blocked_dot_cls = "aa-dot-blocked" if blocked > 0 else "aa-dot-rejected"
+
+    return (
+        f'<div class="aa-summary-strip">'
+        f'<div class="aa-summary-spend">'
+        f'<span class="aa-summary-label">Spent</span>'
+        f'<span class="aa-summary-money">{money_html(spent)} <span class="aa-summary-cap">/ {money_html(budget)}</span></span>'
+        f'<div class="aa-summary-bar-track" role="progressbar" aria-valuenow="{int(round(pct * 100))}" aria-valuemin="0" aria-valuemax="100">'
+        f'<div class="aa-summary-bar-fill" style="width:{bar_width:.1f}%;background:{bar_color};"></div>'
+        f"</div>"
+        f"</div>"
+        f'<div class="aa-summary-counts">'
+        f'<div class="aa-summary-stat">'
+        f'<span class="aa-summary-dot {pending_dot_cls}"></span>'
+        f'<span class="aa-summary-stat-label">Pending</span>'
+        f'<span class="aa-summary-stat-val">{pending}</span>'
+        f"</div>"
+        f'<div class="aa-summary-stat">'
+        f'<span class="aa-summary-dot {blocked_dot_cls}"></span>'
+        f'<span class="aa-summary-stat-label">Blocked</span>'
+        f'<span class="aa-summary-stat-val">{blocked}</span>'
+        f"</div>"
+        f"</div>"
+        f"</div>"
+    )
+
+
+def render_metrics_banner(
+    db_path: str | None = None,
+    compact_strip: bool = True,
+    compact: bool = True,
+) -> None:
+    """Render the unified single-row summary strip on every page."""
+    m = (
+        get_dashboard_metrics(db_path=db_path)
+        if db_path
+        else get_dashboard_metrics()
+    )
+    st.markdown(get_summary_strip_html(m), unsafe_allow_html=True)
+
+
+# ==============================================================================
+# 11. AG GRID V4 THEME CONFIGURATION
+# ==============================================================================
+def get_aggrid_theme_params() -> dict:
+    """
+    Generate AG Grid theme parameters directly from `TOKENS`:
+    - Header row `#F5F5F4` with ink (`#1C1917`) 500-weight text
+    - White rows (`#FFFFFF`), hairline `#E7E5E4` borders
+    - Selected row `#F3EFF5`
+    """
+    return {
+        "backgroundColor": TOKENS["surface"],
+        "foregroundColor": TOKENS["ink"],
+        "headerBackgroundColor": TOKENS["grid-header-bg"],
+        "headerTextColor": TOKENS["grid-header-fg"],
+        "headerFontWeight": 500,
+        "oddRowBackgroundColor": TOKENS["surface"],
+        "rowHoverColor": TOKENS["canvas"],
+        "selectedRowBackgroundColor": TOKENS["grid-selected-bg"],
+        "borderColor": TOKENS["border"],
+        "wrapperBorderRadius": 10,
+        "fontFamily": TOKENS["font-sans"],
+        "fontSize": 13,
+    }
+
+
+def get_aggrid_custom_css() -> dict:
+    """Custom CSS rules injected into the st_aggrid iframe for v4 calm styling."""
     t = TOKENS
     return {
-        "fontFamily": [{"googleFont": "Inter"}, "system-ui", "sans-serif"],
-        "fontSize": 13,
-        "headerFontSize": 11,
-        "headerFontWeight": 600,
-        "backgroundColor": t["surface"],
-        "foregroundColor": t["text-soft"],
-        "headerTextColor": t["text-muted"],
-        "headerBackgroundColor": t["surface-muted"],
-        "chromeBackgroundColor": t["surface-muted"],
-        "borderColor": t["border"],
-        "accentColor": t["primary"],
-        "rowHoverColor": t["surface-muted"],
-        "selectedRowBackgroundColor": t["primary-soft"],
-        "wrapperBorderRadius": 12,
-        "borderRadius": 8,
-        "columnBorder": False,
-        "spacing": 7,
-    }
-
-
-def get_aggrid_custom_css() -> Dict[str, Dict[str, str]]:
-    """Iframe CSS for status pills, wrapped reasons and the pinned total row."""
-    t = TOKENS
-    css: Dict[str, Dict[str, str]] = {
-        ".ag-header-cell-text": {"text-transform": "uppercase", "letter-spacing": "0.05em"},
+        ".ag-root-wrapper": {
+            "border": f"1px solid {t['border']} !important",
+            "border-radius": f"{t['radius-card']} !important",
+            "background-color": f"{t['surface']} !important",
+            "box-shadow": "none !important",
+            "font-family": f"{t['font-sans']} !important",
+        },
+        ".ag-header": {
+            "background-color": f"{t['grid-header-bg']} !important",
+            "border-bottom": f"1px solid {t['border']} !important",
+        },
+        ".ag-header-cell-text": {
+            "color": f"{t['grid-header-fg']} !important",
+            "font-weight": "500 !important",
+            "font-size": "12.5px !important",
+        },
+        ".ag-row": {
+            "background-color": f"{t['surface']} !important",
+            "border-bottom-color": f"{t['border']} !important",
+            "color": f"{t['ink']} !important",
+            "font-size": "13px !important",
+        },
+        ".ag-row-hover": {
+            "background-color": f"{t['canvas']} !important",
+        },
+        ".ag-row-selected": {
+            "background-color": f"{t['grid-selected-bg']} !important",
+        },
+        ".ag-cell": {
+            "line-height": "1.45 !important",
+            "padding-top": "8px !important",
+            "padding-bottom": "8px !important",
+            "color": f"{t['ink']} !important",
+        },
         ".aa-pill": {
-            "display": "inline-flex", "align-items": "center", "gap": "6px", "white-space": "nowrap",
-            "padding": "2px 10px", "border-radius": t["radius-pill"], "font-size": "11.5px",
-            "font-weight": "600", "letter-spacing": "0.02em", "line-height": "1.5",
+            "display": "inline-flex !important",
+            "align-items": "center !important",
+            "padding": "2px 8px !important",
+            "border-radius": "9999px !important",
+            "font-size": "11.5px !important",
+            "font-weight": "500 !important",
         },
-        ".aa-pill::before": {
-            "content": '""', "width": "6px", "height": "6px", "border-radius": "50%", "background": "currentColor",
+        ".aa-pill.approved, .aa-pill.executed": {
+            "background-color": f"{t['approved-bg']} !important",
+            "color": f"{t['approved-fg']} !important",
+            "border": f"1px solid {t['approved-border']} !important",
         },
-        ".aa-merchant": {"font-weight": "600", "color": t["text"]},
-        ".aa-amount": {"font-weight": "600", "color": t["text"], "font-variant-numeric": "tabular-nums"},
-        ".aa-mono": {"font-family": "ui-monospace, SFMono-Regular, Menlo, monospace", "font-size": "11.5px"},
-        ".aa-muted": {"color": t["placeholder"]},
-        # Wrapped cells otherwise inherit the full row height as line-height.
-        ".ag-cell-wrap-text": {"line-height": "1.45", "padding-top": "10px", "padding-bottom": "10px",
-                               "word-break": "normal"},
-        ".aa-reasons-cell .aa-r": {"white-space": "normal", "overflow-wrap": "anywhere"},
-        ".aa-reasons-cell .aa-r + .aa-r": {"margin-top": "4px"},
-        ".ag-row-pinned": {"font-weight": "700", "color": t["text"], "background": t["surface-muted"]},
-        ".aa-total-label": {"font-size": "11px", "font-weight": "600", "text-transform": "uppercase",
-                            "letter-spacing": "0.05em", "color": t["text-muted"]},
+        ".aa-pill.pending": {
+            "background-color": f"{t['pending-bg']} !important",
+            "color": f"{t['pending-fg']} !important",
+            "border": f"1px solid {t['pending-border']} !important",
+        },
+        ".aa-pill.blocked": {
+            "background-color": f"{t['blocked-bg']} !important",
+            "color": f"{t['blocked-fg']} !important",
+            "border": f"1px solid {t['blocked-border']} !important",
+        },
+        ".aa-pill.rejected": {
+            "background-color": f"{t['rejected-bg']} !important",
+            "color": f"{t['rejected-fg']} !important",
+            "border": f"1px solid {t['rejected-border']} !important",
+        },
+        ".aa-amount": {
+            "font-variant-numeric": "tabular-nums !important",
+            "font-weight": "500 !important",
+        },
+        ".aa-mono": {
+            "font-family": f"{t['font-mono']} !important",
+            "font-size": "12px !important",
+            "color": f"{t['text-secondary']} !important",
+        },
     }
-    for meta in STATUS_META.values():
-        cls = meta["cls"]
-        css[f".aa-pill.{cls}"] = {"color": t[f"{cls}-fg"], "background": t[f"{cls}-bg"]}
-    return css
+
+
+# ==============================================================================
+# 12. GLOBAL CSS INJECTION (V4 Calm Neutral Stylesheet)
+# ==============================================================================
+def inject_custom_css() -> None:
+    """Inject the v4 calm, white, low-saturation stylesheet derived from TOKENS."""
+    t = TOKENS
+    css = f"""
+<style>
+:root {{
+    --aa-canvas: {t["canvas"]};
+    --aa-surface: {t["surface"]};
+    --aa-border: {t["border"]};
+    --aa-border-strong: {t["border-strong"]};
+    --aa-divider: {t["divider"]};
+    --aa-ink: {t["ink"]};
+    --aa-text: {t["ink"]};
+    --aa-text-heading: {t["ink"]};
+    --aa-text-secondary: {t["text-secondary"]};
+    --aa-text-soft: {t["text-secondary"]};
+    --aa-text-muted: {t["text-muted"]};
+    --aa-plum: {t["plum"]};
+    --aa-nav-active-bg: {t["nav-active-bg"]};
+    --aa-focus-ring: {t["focus-ring"]};
+    --aa-approved-fg: {t["approved-fg"]};
+    --aa-pending-solid: {t["pending-bar"]};
+    --aa-blocked-fg: {t["blocked-fg"]};
+    --aa-rejected-solid: {t["rejected-bar"]};
+    --aa-radius-card: {t["radius-card"]};
+    --aa-radius-input: {t["radius-input"]};
+    --aa-radius-button: {t["radius-button"]};
+    --aa-radius-pill: {t["radius-pill"]};
+    --aa-shadow: {t["shadow"]};
+    --aa-font-sans: {t["font-sans"]};
+    --aa-font-mono: {t["font-mono"]};
+}}
+
+/* Global typography & canvas — system font stack, weights 400 and 500 only */
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
+    background: {t["canvas"]} !important;
+    color: {t["ink"]} !important;
+    font-family: {t["font-sans"]} !important;
+    font-size: 14px !important;
+    font-weight: 400 !important;
+    -webkit-font-smoothing: antialiased;
+}}
+
+/* Enforce two weights only (400 and 500) across headings and strong text */
+h1, h2, h3, h4, h5, h6, strong, b, th, label {{
+    font-family: {t["font-sans"]} !important;
+    font-weight: 500 !important;
+    color: {t["ink"]};
+}}
+
+/* Transparent Streamlit chrome header */
+header[data-testid="stHeader"] {{
+    background: transparent !important;
+    height: 1.5rem !important;
+}}
+
+/* Tight top container so main content starts well within top third of 1440x900 */
+[data-testid="stMainBlockContainer"], .main .block-container {{
+    max-width: 1120px !important;
+    padding-top: 0.5rem !important;
+    padding-bottom: 5.5rem !important;
+    padding-left: 1.75rem !important;
+    padding-right: 1.75rem !important;
+}}
+
+/* ==========================================================================
+   SIDEBAR: White (#FFFFFF), 1px right border (#E7E5E4), readable ink text
+   ========================================================================== */
+[data-testid="stSidebar"] {{
+    background: {t["surface"]} !important;
+    border-right: 1px solid {t["border"]} !important;
+}}
+
+[data-testid="stSidebar"] > div:first-child {{
+    background: {t["surface"]} !important;
+}}
+
+/* Native Streamlit sidebar nav items: active has #F3EFF5 bg and plum #4A3357 text, inactive #57534E */
+[data-testid="stSidebarNav"] a {{
+    border-radius: {t["radius-button"]} !important;
+    padding: 0.42rem 0.65rem !important;
+    margin: 2px 0 !important;
+    color: {t["text-secondary"]} !important;
+    font-weight: 400 !important;
+    transition: background-color 150ms ease !important;
+}}
+
+[data-testid="stSidebarNav"] a span {{
+    color: {t["text-secondary"]} !important;
+    font-size: 13.5px !important;
+    font-weight: 400 !important;
+}}
+
+[data-testid="stSidebarNav"] a:hover {{
+    background: {t["secondary-hover"]} !important;
+}}
+
+[data-testid="stSidebarNav"] a[aria-current="page"] {{
+    background: {t["nav-active-bg"]} !important;
+    color: {t["plum"]} !important;
+    font-weight: 500 !important;
+}}
+
+[data-testid="stSidebarNav"] a[aria-current="page"] span {{
+    color: {t["plum"]} !important;
+    font-weight: 500 !important;
+}}
+
+.aa-side-label {{
+    font-size: 12px;
+    font-weight: 500;
+    color: {t["text-secondary"]};
+    margin: 4px 0 4px 0;
+}}
+
+.aa-side-note {{
+    font-size: 12px;
+    color: {t["text-secondary"]};
+    background: {t["canvas"]};
+    border: 1px solid {t["border"]};
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-top: 6px;
+}}
+
+[data-testid="stSidebar"] [data-testid="stExpander"] {{
+    background: {t["surface"]} !important;
+    border: 1px solid {t["border"]} !important;
+    border-radius: {t["radius-card"]} !important;
+    box-shadow: none !important;
+}}
+
+[data-testid="stSidebar"] [data-testid="stExpander"] summary p {{
+    color: {t["text-secondary"]} !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+}}
+
+/* Sidebar Gemini quota block */
+.aa-sidebar-quota {{
+    margin: 8px 0 6px 0;
+    padding: 8px 10px;
+    background: {t["canvas"]};
+    border: 1px solid {t["border"]};
+    border-radius: 8px;
+}}
+
+.aa-sidebar-quota-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: {t["text-secondary"]};
+    margin-bottom: 6px;
+}}
+
+.aa-sidebar-quota-val {{
+    font-weight: 500;
+    color: {t["ink"]};
+    font-variant-numeric: tabular-nums;
+}}
+
+.aa-sidebar-quota-track {{
+    width: 100%;
+    height: 4px;
+    background: {t["divider"]};
+    border-radius: 9999px;
+    overflow: hidden;
+}}
+
+.aa-sidebar-quota-fill {{
+    height: 100%;
+    background: {t["ink"]};
+    border-radius: 9999px;
+}}
+
+.aa-side-alert {{
+    margin-top: 8px;
+    padding: 9px 11px;
+    background: {t["surface"]};
+    border: 1px solid {t["border"]};
+    border-left: 3px solid {t["blocked-bar"]};
+    border-radius: 8px;
+    font-size: 12px;
+    color: {t["text-secondary"]};
+}}
+
+.aa-side-alert-title {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
+    color: {t["ink"]};
+    margin-bottom: 4px;
+}}
+
+/* Sidebar PayPal status footer */
+.aa-side-status {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 2px 4px 2px;
+    margin-top: 8px;
+    border-top: 1px solid {t["divider"]};
+    font-size: 12px;
+    color: {t["text-secondary"]};
+}}
+
+.aa-sdot {{
+    width: 7px;
+    height: 7px;
+    border-radius: 9999px;
+    display: inline-block;
+    flex-shrink: 0;
+}}
+
+.aa-sdot.ok {{
+    background: {t["approved-bar"]};
+}}
+
+.aa-sdot.warn {{
+    background: {t["pending-bar"]};
+}}
+
+/* ==========================================================================
+   PAGE HEADER: Single row, 22px title on left, neutral mode pill on right
+   ========================================================================== */
+.aa-page-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 0 0 8px 0;
+}}
+
+.aa-page-title {{
+    margin: 0 !important;
+    padding: 0 !important;
+    font-size: 22px !important;
+    line-height: 1.25 !important;
+    font-weight: 500 !important;
+    color: {t["ink"]} !important;
+    letter-spacing: -0.015em;
+}}
+
+.aa-section-sub {{
+    font-size: 13px;
+    color: {t["text-secondary"]};
+    margin: -2px 0 10px 0;
+}}
+
+.aa-mode-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: {t["radius-pill"]};
+    background: {t["surface"]};
+    border: 1px solid {t["border"]};
+    color: {t["text-secondary"]};
+    font-size: 12px;
+    font-weight: 500;
+}}
+
+.aa-mode-dot {{
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+}}
+
+.aa-mode-dot-live {{
+    background: {t["approved-bar"]};
+}}
+
+.aa-mode-dot-mock {{
+    background: {t["text-muted"]};
+}}
+
+/* ==========================================================================
+   SUMMARY STRIP ON EVERY PAGE
+   ========================================================================== */
+.aa-summary-strip {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px 20px;
+    background: {t["surface"]};
+    border: 1px solid {t["border"]};
+    border-radius: {t["radius-card"]};
+    padding: 9px 14px;
+    margin-bottom: 10px;
+    box-shadow: {t["shadow"]};
+}}
+
+.aa-summary-spend {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}}
+
+.aa-summary-label {{
+    font-size: 13px;
+    color: {t["text-secondary"]};
+    font-weight: 400;
+}}
+
+.aa-summary-money {{
+    font-size: 14px;
+    font-weight: 500;
+    color: {t["ink"]};
+    font-variant-numeric: tabular-nums;
+}}
+
+.aa-summary-cap {{
+    color: {t["text-secondary"]};
+    font-weight: 400;
+}}
+
+.aa-summary-bar-track {{
+    width: 120px;
+    height: 4px;
+    background: {t["gauge-track"]};
+    border-radius: 9999px;
+    overflow: hidden;
+}}
+
+.aa-summary-bar-fill {{
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 150ms ease;
+}}
+
+.aa-summary-counts {{
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+}}
+
+.aa-summary-stat {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: {t["text-secondary"]};
+}}
+
+.aa-summary-dot {{
+    width: 7px;
+    height: 7px;
+    border-radius: 9999px;
+    display: inline-block;
+}}
+
+.aa-summary-stat-val {{
+    font-weight: 500;
+    color: {t["ink"]};
+    font-variant-numeric: tabular-nums;
+}}
+
+/* ==========================================================================
+   PIPELINE STRIP (Agent -> Rules -> PayPal)
+   ========================================================================== */
+.aa-pipeline-strip {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: {t["surface"]};
+    border: 1px solid {t["border"]};
+    border-radius: {t["radius-card"]};
+    padding: 8px 14px;
+    margin-bottom: 10px;
+    box-shadow: {t["shadow"]};
+}}
+
+.aa-pipe-node {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}}
+
+.aa-pipe-tile {{
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: {t["canvas"]};
+    border: 1px solid {t["border"]};
+    color: {t["text-secondary"]};
+    flex-shrink: 0;
+}}
+
+.aa-pipe-meta {{
+    display: flex;
+    flex-direction: column;
+    line-height: 1.2;
+}}
+
+.aa-pipe-title {{
+    font-size: 13px;
+    font-weight: 500;
+    color: {t["ink"]};
+}}
+
+.aa-pipe-sub {{
+    font-size: 11.5px;
+    color: {t["text-muted"]};
+}}
+
+/* Lit pipeline node states */
+.aa-pipe-active .aa-pipe-tile,
+.aa-pipe-done .aa-pipe-tile {{
+    background: {t["nav-active-bg"]};
+    border-color: {t["border-strong"]};
+    color: {t["plum"]};
+}}
+
+.aa-pipe-approved .aa-pipe-tile {{
+    background: {t["approved-bg"]};
+    border-color: {t["approved-border"]};
+    color: {t["approved-fg"]};
+}}
+
+.aa-pipe-approved .aa-pipe-sub {{
+    color: {t["approved-fg"]};
+}}
+
+.aa-pipe-pending .aa-pipe-tile {{
+    background: {t["pending-bg"]};
+    border-color: {t["pending-border"]};
+    color: {t["pending-fg"]};
+}}
+
+.aa-pipe-pending .aa-pipe-sub {{
+    color: {t["pending-fg"]};
+}}
+
+.aa-pipe-blocked .aa-pipe-tile,
+.aa-pipe-error .aa-pipe-tile {{
+    background: {t["blocked-bg"]};
+    border-color: {t["blocked-border"]};
+    color: {t["blocked-fg"]};
+}}
+
+.aa-pipe-blocked .aa-pipe-sub,
+.aa-pipe-error .aa-pipe-sub {{
+    color: {t["blocked-fg"]};
+}}
+
+.aa-pipe-dark .aa-pipe-tile {{
+    background: {t["canvas"]};
+    border: 1px dashed {t["border-strong"]};
+    color: {t["text-muted"]};
+}}
+
+.aa-pipe-conn {{
+    flex: 1;
+    height: 1px;
+    background: {t["border"]};
+    min-width: 18px;
+}}
+
+.aa-pipe-conn-lit {{
+    background: {t["approved-bar"]};
+}}
+
+.aa-pipe-conn-active {{
+    background: {t["plum"]};
+}}
+
+.aa-pipe-conn-dashed {{
+    background: transparent;
+    border-top: 1px dashed {t["border-strong"]};
+    height: 0;
+}}
+
+/* ==========================================================================
+   STATUS PILLS & DOTS
+   ========================================================================== */
+.aa-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: {t["radius-pill"]};
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.3;
+    white-space: nowrap;
+}}
+
+.aa-pill.approved, .aa-pill.executed,
+.aa-pill-approved, .aa-pill-executed {{
+    background: {t["approved-bg"]};
+    color: {t["approved-fg"]};
+    border: 1px solid {t["approved-border"]};
+}}
+
+.aa-pill.pending, .aa-pill-pending {{
+    background: {t["pending-bg"]};
+    color: {t["pending-fg"]};
+    border: 1px solid {t["pending-border"]};
+}}
+
+.aa-pill.blocked, .aa-pill-blocked {{
+    background: {t["blocked-bg"]};
+    color: {t["blocked-fg"]};
+    border: 1px solid {t["blocked-border"]};
+}}
+
+.aa-pill.rejected, .aa-pill-rejected {{
+    background: {t["rejected-bg"]};
+    color: {t["rejected-fg"]};
+    border: 1px solid {t["rejected-border"]};
+}}
+
+.aa-dot-approved, .aa-dot-executed {{ background: {t["approved-dot"]}; }}
+.aa-dot-pending {{ background: {t["pending-dot"]}; }}
+.aa-dot-blocked {{ background: {t["blocked-dot"]}; }}
+.aa-dot-rejected {{ background: {t["rejected-dot"]}; }}
+
+/* ==========================================================================
+   DECISION CARD (Chat & Approvals)
+   ========================================================================== */
+.aa-decision-card {{
+    position: relative;
+    display: flex;
+    background: {t["surface"]};
+    border: 1px solid {t["border"]};
+    border-radius: {t["radius-card"]};
+    overflow: hidden;
+    box-shadow: {t["shadow"]};
+    margin: 6px 0 12px 0;
+}}
+
+.aa-decision-accent {{
+    width: 3px;
+    flex-shrink: 0;
+}}
+
+.aa-accent-approved, .aa-accent-executed {{ background: {t["approved-bar"]}; }}
+.aa-accent-pending {{ background: {t["pending-bar"]}; }}
+.aa-accent-blocked {{ background: {t["blocked-bar"]}; }}
+.aa-accent-rejected {{ background: {t["rejected-bar"]}; }}
+
+.aa-decision-inner {{
+    flex: 1;
+    min-width: 0;
+    padding: 14px 16px;
+}}
+
+.aa-decision-head {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}}
+
+.aa-decision-head-left {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}}
+
+.aa-decision-icon {{
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}}
+
+.aa-icon-approved, .aa-icon-executed {{
+    background: {t["approved-bg"]};
+    border: 1px solid {t["approved-border"]};
+    color: {t["approved-fg"]};
+}}
+
+.aa-icon-pending {{
+    background: {t["pending-bg"]};
+    border: 1px solid {t["pending-border"]};
+    color: {t["pending-fg"]};
+}}
+
+.aa-icon-blocked {{
+    background: {t["blocked-bg"]};
+    border: 1px solid {t["blocked-border"]};
+    color: {t["blocked-fg"]};
+}}
+
+.aa-icon-rejected {{
+    background: {t["rejected-bg"]};
+    border: 1px solid {t["rejected-border"]};
+    color: {t["rejected-fg"]};
+}}
+
+.aa-decision-title {{
+    font-size: 14px;
+    font-weight: 500;
+    color: {t["ink"]};
+    line-height: 1.25;
+}}
+
+.aa-decision-sub {{
+    font-size: 12px;
+    color: {t["text-secondary"]};
+    line-height: 1.3;
+}}
+
+.aa-decision-divider {{
+    height: 1px;
+    background: {t["divider"]};
+    margin: 11px 0;
+}}
+
+.aa-decision-deal {{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}}
+
+.aa-decision-merchant-wrap {{
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+}}
+
+.aa-decision-merchant {{
+    font-size: 14px;
+    font-weight: 500;
+    color: {t["ink"]};
+    overflow-wrap: anywhere;
+}}
+
+.aa-decision-cat {{
+    font-size: 12px;
+    color: {t["text-secondary"]};
+    background: {t["canvas"]};
+    border: 1px solid {t["border"]};
+    padding: 1px 7px;
+    border-radius: 9999px;
+    overflow-wrap: anywhere;
+}}
+
+.aa-decision-amount {{
+    font-size: 20px;
+    font-weight: 500;
+    color: {t["ink"]};
+    font-variant-numeric: tabular-nums;
+}}
+
+.aa-verdict-reasons {{
+    list-style: none;
+    padding: 0;
+    margin: 0 0 10px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}}
+
+.aa-verdict-reasons li {{
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 13px;
+    color: {t["ink"]};
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}}
+
+.aa-reason-dot {{
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    margin-top: 6px;
+    flex-shrink: 0;
+}}
+
+.aa-verdict-order-meta {{
+    font-size: 12px;
+    color: {t["text-secondary"]};
+    margin-bottom: 8px;
+}}
+
+.aa-mono {{
+    background: {t["rejected-bg"]};
+    color: {t["ink"]};
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: {t["font-mono"]};
+    font-size: 11.5px;
+}}
+
+.aa-decision-next {{
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 12.5px;
+    color: {t["text-secondary"]};
+    line-height: 1.45;
+    padding-top: 8px;
+    border-top: 1px solid {t["divider"]};
+    margin-bottom: 0;
+}}
+
+.aa-decision-next-icon {{
+    color: {t["text-muted"]};
+    margin-top: 1px;
+    flex-shrink: 0;
+}}
+
+/* ==========================================================================
+   CHAT BUBBLES & EMPTY STATE
+   ========================================================================== */
+[data-testid="stChatMessage"] {{
+    background: transparent !important;
+    border: none !important;
+    padding: 0.25rem 0 !important;
+}}
+
+.aa-user-msg {{
+    display: inline-block;
+    max-width: 76%;
+    background: {t["user-bubble-bg"]};
+    color: {t["user-bubble-fg"]};
+    border-radius: {t["radius-card"]};
+    padding: 9px 13px;
+    font-size: 13.5px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}}
+
+/* Agent has NO bubble: plain text next to small neutral avatar tile, never clipped */
+.aa-agent-msg {{
+    background: transparent;
+    color: {t["ink"]};
+    font-size: 13.5px;
+    line-height: 1.5;
+    padding: 2px 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}}
+
+/* Empty state & quiet scenario cards */
+.aa-empty-state {{
+    text-align: center;
+    padding: 8px 12px 6px 12px;
+}}
+
+.aa-empty-illus {{
+    display: inline-flex;
+    margin-bottom: 4px;
+}}
+
+.aa-empty-title {{
+    font-size: 14px;
+    font-weight: 500;
+    color: {t["ink"]};
+    margin-bottom: 2px;
+}}
+
+.aa-empty-sub {{
+    font-size: 13px;
+    color: {t["text-secondary"]};
+}}
+
+.aa-card-head {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}}
+
+.aa-icon-chip {{
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    border: 1px solid {t["border"]};
+    background: {t["canvas"]};
+    color: {t["text-secondary"]};
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}}
+
+.aa-card-title {{
+    font-size: 14px;
+    font-weight: 500;
+    color: {t["ink"]};
+    margin-bottom: 2px;
+}}
+
+.aa-card-desc {{
+    font-size: 13px;
+    color: {t["text-secondary"]};
+    line-height: 1.4;
+    margin-bottom: 8px;
+}}
+
+[class*="st-key-aa-card-scn-"] .aa-card-desc {{
+    min-height: 36px;
+}}
+
+.aa-label {{
+    font-size: 12px;
+    font-weight: 500;
+    color: {t["text-secondary"]};
+    margin-bottom: 3px;
+}}
+
+/* Rules & Ledger helpers */
+.aa-field-error {{
+    font-size: 12.5px;
+    color: {t["blocked-fg"]};
+    background: {t["blocked-bg"]};
+    border: 1px solid {t["blocked-border"]};
+    border-radius: 7px;
+    padding: 5px 9px;
+    margin-top: 4px;
+    margin-bottom: 6px;
+}}
+
+.aa-field-hint {{
+    font-size: 12.5px;
+    color: {t["pending-fg"]};
+    background: {t["pending-bg"]};
+    border: 1px solid {t["pending-border"]};
+    border-radius: 7px;
+    padding: 6px 10px;
+    margin-top: 6px;
+}}
+
+.aa-chips {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+}}
+
+.aa-chip {{
+    font-size: 12px;
+    color: {t["ink"]};
+    background: {t["canvas"]};
+    border: 1px solid {t["border"]};
+    border-radius: 9999px;
+    padding: 2px 9px;
+}}
+
+.aa-saved {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12.5px;
+    color: {t["approved-fg"]};
+}}
+
+.aa-dirty {{
+    font-size: 12.5px;
+    color: {t["pending-fg"]};
+}}
+
+.aa-kv {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px 16px;
+    margin: 10px 0;
+    padding: 10px 0;
+    border-top: 1px solid {t["divider"]};
+    border-bottom: 1px solid {t["divider"]};
+}}
+
+.aa-v {{
+    font-size: 13.5px;
+    color: {t["ink"]};
+    overflow-wrap: anywhere;
+}}
+
+.aa-v.big {{
+    font-size: 20px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}}
+
+/* Bottom spacer on chat page so fixed input never clips last card */
+.aa-chat-bottom-spacer {{
+    height: 76px;
+}}
+
+/* ==========================================================================
+   BUTTONS, INPUTS, CARDS & MOTION
+   ========================================================================== */
+[data-testid="stBaseButton-primary"],
+[data-testid="stFormSubmitButton"] button {{
+    background: {t["primary-bg"]} !important;
+    color: {t["primary-text"]} !important;
+    border: 1px solid {t["primary-bg"]} !important;
+    border-radius: {t["radius-button"]} !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+    padding: 0.42rem 0.85rem !important;
+    box-shadow: none !important;
+    transition: background-color 150ms ease, border-color 150ms ease !important;
+}}
+
+[data-testid="stBaseButton-primary"] p,
+[data-testid="stBaseButton-primary"] span,
+[data-testid="stFormSubmitButton"] button p,
+[data-testid="stFormSubmitButton"] button span {{
+    color: {t["primary-text"]} !important;
+    font-weight: 500 !important;
+}}
+
+[data-testid="stBaseButton-primary"]:hover,
+[data-testid="stFormSubmitButton"] button:hover {{
+    background: {t["primary-hover"]} !important;
+    border-color: {t["primary-hover"]} !important;
+}}
+
+[data-testid="stBaseButton-secondary"],
+[data-testid="stDownloadButton"] button,
+[data-testid="stLinkButton"] a,
+[data-testid="stPageLink-NavLink"] {{
+    background: {t["secondary-bg"]} !important;
+    color: {t["secondary-text"]} !important;
+    border: 1px solid {t["secondary-border"]} !important;
+    border-radius: {t["radius-button"]} !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+    padding: 0.42rem 0.85rem !important;
+    box-shadow: none !important;
+    transition: background-color 150ms ease, border-color 150ms ease !important;
+}}
+
+[data-testid="stBaseButton-secondary"]:hover,
+[data-testid="stDownloadButton"] button:hover,
+[data-testid="stLinkButton"] a:hover,
+[data-testid="stPageLink-NavLink"]:hover {{
+    background: {t["secondary-hover"]} !important;
+    color: {t["ink"]} !important;
+}}
+
+/* Inputs & Chat Input: white fill, 1px #D6D3D1 border, plum focus ring */
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea {{
+    background: {t["surface"]} !important;
+    color: {t["ink"]} !important;
+    border: 1px solid {t["border-strong"]} !important;
+    border-radius: {t["radius-input"]} !important;
+    font-size: 13.5px !important;
+}}
+
+[data-testid="stTextInput"] input:focus,
+[data-testid="stNumberInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {{
+    border-color: {t["plum"]} !important;
+    box-shadow: 0 0 0 2px {t["focus-ring"]} !important;
+    outline: none !important;
+}}
+
+[data-testid="stChatInput"] > div {{
+    background: {t["surface"]} !important;
+    border: 1px solid {t["border-strong"]} !important;
+    border-radius: {t["radius-input"]} !important;
+    box-shadow: {t["shadow"]} !important;
+}}
+
+[data-testid="stChatInput"] > div:focus-within {{
+    border-color: {t["plum"]} !important;
+    box-shadow: 0 0 0 2px {t["focus-ring"]} !important;
+}}
+
+[data-testid="stChatInput"] textarea {{
+    color: {t["ink"]} !important;
+    font-size: 13.5px !important;
+}}
+
+[data-testid="stChatInputSubmitButton"] {{
+    background: {t["ink"]} !important;
+    color: {t["surface"]} !important;
+    border-radius: 6px !important;
+}}
+
+[data-testid="stChatInputSubmitButton"] svg {{
+    fill: {t["surface"]} !important;
+}}
+
+/* Bordered containers (Scenario, Rules & Ledger cards) */
+[data-testid="stVerticalBlockBorderWrapper"] {{
+    background: {t["surface"]} !important;
+    border: 1px solid {t["border"]} !important;
+    border-radius: {t["radius-card"]} !important;
+    box-shadow: {t["shadow"]} !important;
+}}
+
+/* Quota notice */
+.aa-quota-banner {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: {t["pending-bg"]};
+    border: 1px solid {t["pending-border"]};
+    color: {t["pending-fg"]};
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12.5px;
+    margin-bottom: 10px;
+}}
+
+.aa-quota-dot {{
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: {t["pending-dot"]};
+    flex-shrink: 0;
+}}
+
+/* Respect prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }}
+}}
+</style>
+"""
+    st.markdown(css, unsafe_allow_html=True)
+
+
+# Alias expected by app.py
+inject_theme_css = inject_custom_css

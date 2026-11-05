@@ -1,42 +1,61 @@
-# Agent Allowance theme (Streamlit 1.65).
-#
-# ROOT CAUSE of the old "black input boxes": `secondaryBackgroundColor` was set to
-# navy (#0F172A). Streamlit uses secondaryBackgroundColor as the fill for text
-# inputs, text areas, number inputs, selects and chat input, so every widget in the
-# main area turned navy with navy text. The global theme is now light, and the navy
-# palette is scoped to the sidebar through [theme.sidebar] (supported in 1.65,
-# verified against streamlit.config option registry).
+# ==============================================================================
+# Agent Allowance — Streamlit Configuration (v4 Calm Neutral Palette)
+# Mirrors TOKENS defined in agent_allowance/ui_theme.py:
+#   canvas #FAFAF9, surface #FFFFFF, border #E7E5E4, stronger border #D6D3D1,
+#   divider #F0EFED, ink #1C1917, secondary #57534E, muted #78716C,
+#   plum accent #4A3357, active nav bg #F3EFF5
+# ==============================================================================
 
 [theme]
 base = "light"
-primaryColor = "#2563EB"
-backgroundColor = "#F7F8FA"
-secondaryBackgroundColor = "#F1F5F9"
-textColor = "#0F172A"
-borderColor = "#CBD5E1"
+primaryColor = "#1C1917"
+backgroundColor = "#FAFAF9"
+# Keep secondaryBackgroundColor light (#FFFFFF) so input widgets stay light and readable
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1C1917"
+borderColor = "#E7E5E4"
 showWidgetBorder = true
-linkColor = "#2563EB"
+showSidebarBorder = true
+linkColor = "#4A3357"
 baseRadius = "10px"
-buttonRadius = "10px"
-font = "Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
-codeBackgroundColor = "#F1F5F9"
-codeTextColor = "#0F172A"
-dataframeHeaderBackgroundColor = "#F1F5F9"
-dataframeBorderColor = "#E2E8F0"
-showSidebarBorder = false
+buttonRadius = "7px"
+font = "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+headingFont = "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+baseFontWeight = 400
+headingFontWeights = 500
+codeBackgroundColor = "#F5F5F4"
+codeTextColor = "#1C1917"
+dataframeHeaderBackgroundColor = "#F5F5F4"
+dataframeHeaderTextColor = "#1C1917"
+dataframeBorderColor = "#E7E5E4"
+
+# Semantic status palette mirrored from TOKENS
+greenColor = "#5E9B6E"
+greenBackgroundColor = "#EEF5EF"
+greenTextColor = "#2F6B3E"
+orangeColor = "#C79A3B"
+orangeBackgroundColor = "#FBF5E8"
+orangeTextColor = "#8A5A12"
+redColor = "#B45454"
+redBackgroundColor = "#FBEFEF"
+redTextColor = "#9B3B3B"
+grayColor = "#A8A29E"
+grayBackgroundColor = "#F5F5F4"
+grayTextColor = "#57534E"
 
 [theme.sidebar]
-backgroundColor = "#0F172A"
-secondaryBackgroundColor = "#1E293B"
-textColor = "#E2E8F0"
-primaryColor = "#60A5FA"
-borderColor = "#334155"
-linkColor = "#93C5FD"
-codeBackgroundColor = "#1E293B"
-codeTextColor = "#E2E8F0"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FAFAF9"
+textColor = "#1C1917"
+primaryColor = "#4A3357"
+borderColor = "#E7E5E4"
+linkColor = "#4A3357"
+codeBackgroundColor = "#F5F5F4"
+codeTextColor = "#1C1917"
 
 [client]
 toolbarMode = "minimal"
+showErrorDetails = "none"
 
-[server]
-runOnSave = true
+[browser]
+gatherUsageStats = false

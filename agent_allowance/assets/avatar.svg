@@ -1,0 +1,6 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7.5" fill="#F5F5F4" stroke="#E7E5E4"/>
+  <!-- Neutral ink shield icon -->
+  <path d="M16 7.5L23.5 10.6V16.8C23.5 21.3 20.3 25.1 16 26.5C11.7 25.1 8.5 21.3 8.5 16.8V10.6L16 7.5Z" stroke="#1C1917" stroke-width="1.6" stroke-linejoin="round"/>
+  <path d="M13 16.8L15.1 18.9L19.3 14.7" stroke="#1C1917" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
