@@ -188,7 +188,12 @@ def test_ledger_detail_escapes_every_field(captured):
         "agent_reason": IMG, "proposal": {"item_title": SCRIPT},
     }
     app._render_ledger_detail(row)
-    assert_inert(captured[0], IMG, SCRIPT, BREAKOUT, LONG)
+    # Header ("Selected: #id · merchant") and body render as separate chunks.
+    assert len(captured) >= 2
+    for chunk in captured:
+        assert_inert(chunk)
+    assert_inert("".join(captured), IMG, SCRIPT, BREAKOUT, LONG)
+    assert "Selected: #7 · " in captured[0]
 
 
 def test_approvals_card_escapes_every_field(captured, monkeypatch):

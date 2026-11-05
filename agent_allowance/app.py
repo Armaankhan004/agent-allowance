@@ -420,6 +420,13 @@ def switch_to_mock_mode() -> None:
     st.session_state["aa_mode"] = MODE_MOCK
 
 
+def gemini_caps_caption(cap: int) -> str:
+    """Sidebar caption for Gemini mode: the app's per-session cap plus Google's daily quota."""
+    noun = "request" if cap == 1 else "requests"
+    return (f"Up to {cap} Gemini {noun} per session. Gemini's own daily quota also applies; "
+            "when either runs out, Mock mode keeps working.")
+
+
 def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
     """
     Sidebar Mock/Gemini toggle with the per-session Gemini request meter.
@@ -450,7 +457,10 @@ def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
             )
         else:
             render_html(get_side_meter_html(remaining, cap))
-            st.caption("Mock mode is unlimited.")
+            if state["aa_mode"] == MODE_MOCK:
+                st.caption("Mock mode is unlimited.")
+            else:
+                st.caption(gemini_caps_caption(cap))
         st.divider()
 
     active = effective_mode(state["aa_mode"], state, cap)
@@ -886,6 +896,37 @@ def _approved_total(rows: List[Dict[str, Any]]) -> Decimal:
     return sum((Decimal(r["amount"]) for r in rows if r["status"] in ("APPROVED", "EXECUTED")), Decimal("0.00"))
 
 
+def reason_summary(reasons: Any) -> Tuple[str, int]:
+    """First non-empty reason and how many more follow it (for the compact Reasons cell)."""
+    cleaned = [str(r).strip() for r in (reasons or []) if str(r).strip()]
+    if not cleaned:
+        return "", 0
+    return cleaned[0], len(cleaned) - 1
+
+
+def reason_cell_text(reasons: Any) -> str:
+    """Plain-text compact reason for the st.dataframe fallback: 'first (+N more)'."""
+    first, more = reason_summary(reasons)
+    return f"{first} (+{more} more)" if more else first
+
+
+def ledger_totals_label(rows: List[Dict[str, Any]]) -> str:
+    """'N rows · $X approved and executed (all months)' for the given (already filtered) rows.
+
+    Mirrors the pinned-row JS in _ledger_grid_options so the grid and fallback read the same.
+    """
+    count = len(rows)
+    noun = "row" if count == 1 else "rows"
+    spent = [r for r in rows if r["status"] in ("APPROVED", "EXECUTED")]
+    currencies = {(r.get("currency") or "USD") for r in spent}
+    if len(currencies) > 1:
+        return f"{count} {noun} · mixed currencies (all months)"
+    total = _approved_total(rows)
+    currency = next(iter(currencies), "USD")
+    money = f"${total:,.2f}" if currency == "USD" else f"{total:,.2f} {currency}"
+    return f"{count} {noun} · {money} approved and executed (all months)"
+
+
 def _csv_safe(value: Any) -> str:
     """Stringify for CSV and defuse spreadsheet formula injection."""
     text = "" if value is None else str(value)
@@ -919,11 +960,7 @@ def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
         class StatusRenderer {{
             init(p) {{
                 this.eGui = document.createElement('span');
-                if (p.node.rowPinned) {{
-                    this.eGui.className = 'aa-total-label';
-                    this.eGui.textContent = 'Approved spend';
-                    return;
-                }}
+                if (p.node.rowPinned) return;
                 this.eGui.className = 'aa-pill ' + (({classes})[p.value] || 'rejected');
                 this.eGui.textContent = ({status_label_js})(p.value);
             }}
@@ -931,26 +968,43 @@ def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
             refresh() {{ return false; }}
         }}
     """)
+    # One line: first reason (ellipsis) + a muted "+N more" chip. Full list lives in the
+    # tooltip and the detail card. textContent only, so reasons are never parsed as HTML.
     reasons_renderer = JsCode("""
         class ReasonsRenderer {
             init(p) {
                 this.eGui = document.createElement('div');
-                if (p.node.rowPinned) return;
-                const reasons = (p.data && p.data.reasons_text) ? p.data.reasons_text.split('\\n') : [];
-                if (!reasons.length) {
-                    this.eGui.className = 'aa-muted';
-                    this.eGui.textContent = '\\u2014';
+                this.eGui.className = 'aa-reason-line';
+                if (p.node.rowPinned || !p.data) return;
+                const first = p.data.reason_first || '';
+                const more = Number(p.data.reason_more) || 0;
+                if (!first) {
+                    const m = document.createElement('span');
+                    m.className = 'aa-muted';
+                    m.textContent = '\\u2014';
+                    this.eGui.appendChild(m);
                     return;
                 }
-                reasons.forEach(r => {
-                    const d = document.createElement('div');
-                    d.className = 'aa-r';
-                    d.textContent = r;
-                    this.eGui.appendChild(d);
-                });
+                const t = document.createElement('span');
+                t.className = 'aa-reason-first';
+                t.textContent = first;
+                this.eGui.appendChild(t);
+                if (more > 0) {
+                    const c = document.createElement('span');
+                    c.className = 'aa-more-chip';
+                    c.textContent = '+' + more + ' more';
+                    this.eGui.appendChild(c);
+                }
             }
             getGui() { return this.eGui; }
             refresh() { return false; }
+        }
+    """)
+    reasons_tooltip = JsCode("""
+        function(p) {
+            if (!p.data || p.node.rowPinned || !p.data.reasons_text) return '';
+            const list = p.data.reasons_text.split('\\n');
+            return list.length > 1 ? list.map(r => '\\u2022 ' + r).join('\\n') : list[0];
         }
     """)
     money_formatter = JsCode("""
@@ -963,7 +1017,8 @@ def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
             }
         }
     """)
-    # Recompute the pinned total from the rows that pass the current filters.
+    # Pinned total recomputed from the rows that pass the current filters (preset, search,
+    # column filters). Same wording as ledger_totals_label() in Python.
     update_total = JsCode("""
         function(e) {
             let cents = 0, count = 0;
@@ -973,48 +1028,64 @@ def _ledger_grid_options(quick_filter: str) -> Dict[str, Any]:
                 count += 1;
                 if (n.data.status === 'APPROVED' || n.data.status === 'EXECUTED') {
                     cents += Math.round(Number(n.data.amount_value) * 100);
-                    currencies.add(n.data.currency);
+                    currencies.add(n.data.currency || 'USD');
                 }
             });
-            const mixed = currencies.size > 1;
+            const noun = count === 1 ? ' row' : ' rows';
+            let label;
+            if (currencies.size > 1) {
+                label = count + noun + ' \\u00b7 mixed currencies (all months)';
+            } else {
+                const cur = currencies.size === 1 ? [...currencies][0] : 'USD';
+                let money;
+                try {
+                    money = new Intl.NumberFormat('en-US', {style: 'currency', currency: cur}).format(cents / 100);
+                } catch (err) {
+                    money = (cents / 100).toFixed(2) + ' ' + cur;
+                }
+                label = count + noun + ' \\u00b7 ' + money + ' approved and executed (all months)';
+            }
             e.api.setGridOption('pinnedBottomRowData', [{
                 '::auto_unique_id::': 'aa-total',
-                id: null,
-                timestamp: count + (count === 1 ? ' row' : ' rows'),
-                merchant: mixed ? 'Mixed currencies' : '',
-                amount_value: mixed ? null : cents / 100,
-                currency: currencies.size === 1 ? [...currencies][0] : 'USD',
-                status: '', reasons_text: '', paypal_order_id: ''
+                id: null, total_label: label,
+                timestamp: '', merchant: '', amount_value: null, currency: '',
+                status: '', reasons_text: '', reason_first: '', reason_more: 0, paypal_order_id: ''
             }]);
         }
     """)
 
     return {
         "columnDefs": [
+            # The pinned total row spans every column from here.
             {"field": "id", "headerName": "ID", "width": 72, "cellDataType": "number", "filter": "agNumberColumnFilter",
-             "valueFormatter": JsCode("function(p){ return p.value == null ? 'Total' : '#' + p.value; }"),
-             "cellClass": "aa-muted"},
-            # Explicit "text": v34 otherwise infers dateTimeString and blanks the pinned "N rows" cell.
-            {"field": "timestamp", "headerName": "Time (UTC)", "width": 138, "cellDataType": "text",
-             "filter": "agTextColumnFilter", "wrapText": True, "autoHeight": True},
-            {"field": "merchant", "headerName": "Merchant", "flex": 1, "minWidth": 150, "cellDataType": "text",
-             "filter": "agTextColumnFilter", "cellClass": "aa-merchant", "tooltipField": "category",
-             "wrapText": True, "autoHeight": True},
+             "valueFormatter": JsCode(
+                 "function(p){ if (p.node && p.node.rowPinned) return (p.data && p.data.total_label) || '';"
+                 " return p.value == null ? '' : '#' + p.value; }"),
+             "colSpan": JsCode("function(p){ return (p.node && p.node.rowPinned) ? 7 : 1; }"),
+             "cellClassRules": {"aa-total-label": "node.rowPinned", "aa-muted": "!node.rowPinned"}},
+            # Explicit "text": v34 otherwise infers dateTimeString.
+            {"field": "timestamp", "headerName": "Time (UTC)", "width": 168, "cellDataType": "text",
+             "filter": "agTextColumnFilter"},
+            {"field": "merchant", "headerName": "Merchant", "flex": 1, "cellDataType": "text",
+             "filter": "agTextColumnFilter", "minWidth": 170, "cellClass": "aa-merchant", "tooltipField": "merchant"},
             {"field": "amount_value", "headerName": "Amount", "width": 104, "type": "rightAligned", "cellDataType": "number",
              "filter": "agNumberColumnFilter", "valueFormatter": money_formatter, "cellClass": "aa-amount"},
-            {"field": "status", "headerName": "Status", "width": 160, "cellDataType": "text", "filter": "agTextColumnFilter",
+            {"field": "status", "headerName": "Status", "width": 150, "cellDataType": "text", "filter": "agTextColumnFilter",
              "cellRenderer": status_renderer,
              "filterValueGetter": JsCode(f"function(p){{ return ({status_label_js})(p.data.status); }}"),
              "getQuickFilterText": JsCode(f"function(p){{ return ({status_label_js})(p.value); }}")},
-            {"field": "reasons_text", "headerName": "Reasons", "flex": 2, "minWidth": 220, "cellDataType": "text",
+            {"field": "reasons_text", "headerName": "Reasons", "flex": 2, "minWidth": 240, "cellDataType": "text",
              "filter": "agTextColumnFilter", "cellRenderer": reasons_renderer, "cellClass": "aa-reasons-cell",
-             "wrapText": True, "autoHeight": True, "tooltipField": "reasons_text"},
+             "tooltipValueGetter": reasons_tooltip},
             {"field": "paypal_order_id", "headerName": "PayPal order", "width": 148, "cellDataType": "text",
              "filter": "agTextColumnFilter", "cellClass": "aa-mono", "tooltipField": "paypal_order_id"},
         ],
         "defaultColDef": {"sortable": True, "resizable": True, "filter": True, "suppressHeaderMenuButton": False},
         # No custom getRowId: the component maps returned rows by its own ::auto_unique_id::.
         "rowSelection": {"mode": "singleRow", "checkboxes": False, "enableClickSelection": True},
+        # Row-only selection: no per-cell focus box (AG Grid 34.3.1 bundled with streamlit-aggrid 1.2.1).
+        "suppressCellFocus": True,
+        "rowHeight": 44,
         "pagination": True,
         "paginationPageSize": 10,
         "paginationPageSizeSelector": [10, 25, 50],
@@ -1039,6 +1110,8 @@ def _render_ledger_grid(rows: List[Dict[str, Any]], quick_filter: str) -> Option
         "currency": r["currency"],
         "status": r["status"],
         "reasons_text": "\n".join(r["reasons"]),
+        "reason_first": reason_summary(r["reasons"])[0],
+        "reason_more": reason_summary(r["reasons"])[1],
         "paypal_order_id": r["paypal_order_id"],
     } for r in rows])
     theme = (
@@ -1056,7 +1129,8 @@ def _render_ledger_grid(rows: List[Dict[str, Any]], quick_filter: str) -> Option
         enable_enterprise_modules=False,
         update_on=["selectionChanged", "filterChanged", "sortChanged"],
         show_toolbar=False,
-        key="aa_ledger_grid",
+        # Bumping the nonce remounts the grid, which is how "Clear selection" deselects.
+        key=f"aa_ledger_grid_{st.session_state.get('aa_ledger_grid_nonce', 0)}",
     )
 
 
@@ -1075,19 +1149,32 @@ def _render_ledger_fallback(
         [{
             "ID": r["id"], "Time (UTC)": r["timestamp"], "Merchant": r["merchant"],
             "Amount": f"{r['amount']} {r['currency']}", "Status": _STATUS_LABELS.get(r["status"], r["status"]),
-            "Reasons": " | ".join(r["reasons"]), "PayPal order": r["paypal_order_id"],
+            "Reasons": reason_cell_text(r["reasons"]),
+            "PayPal order": r["paypal_order_id"],
         } for r in rows],
         hide_index=True,
         width="stretch",
         on_select="rerun",
         selection_mode="single-row",
-        key="aa_ledger_fallback",
+        key=f"aa_ledger_fallback_{st.session_state.get('aa_ledger_grid_nonce', 0)}",
     )
-    st.caption(md_escape(
-        f"{len(rows)} rows · Approved spend ${_approved_total(rows):,.2f} · Select a row to read every reason."
-    ))
+    st.caption(md_escape(ledger_totals_label(rows)))
     picked = event.selection.rows if event is not None else []
     return rows, (rows[picked[0]]["id"] if picked and picked[0] < len(rows) else None)
+
+
+def clear_ledger_selection() -> None:
+    """Button callback: remount the grid / fallback table with nothing selected."""
+    st.session_state["aa_ledger_grid_nonce"] = st.session_state.get("aa_ledger_grid_nonce", 0) + 1
+
+
+def _ledger_detail_title_html(row: Dict[str, Any]) -> str:
+    return (
+        f'<div class="aa-ledger-detail-title">'
+        f'<span>Selected: #{html_text(row["id"])} · {html_text(row["merchant"])}</span>'
+        f'{get_status_pill_html(row["status"])}'
+        f"</div>"
+    )
 
 
 def _render_ledger_detail(row: Dict[str, Any]) -> None:
@@ -1116,14 +1203,8 @@ def _render_ledger_detail(row: Dict[str, Any]) -> None:
         if agent_reason else ""
     )
 
-    markup = (
-        f'<div class="aa-decision-card aa-decision-{cls}">'
-        f'<div class="aa-decision-accent aa-accent-{cls}"></div>'
-        f'<div class="aa-decision-inner">'
-        f'<div class="aa-card-head">'
-        f'<div class="aa-card-title">#{html_text(row["id"])} · {html_text(row["merchant"])}</div>'
-        f'{get_status_pill_html(row["status"])}'
-        f"</div>"
+    body = (
+        f'<div class="aa-ledger-detail-body">'
         f'<div class="aa-kv">'
         f'<div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(row["amount"], row["currency"])}</div></div>'
         f'<div><div class="aa-label">Category</div><div class="aa-v">{html_text(row["category"])}</div></div>'
@@ -1136,10 +1217,20 @@ def _render_ledger_detail(row: Dict[str, Any]) -> None:
         f'<div class="aa-label">Policy reasons</div>'
         f'<ul class="aa-verdict-reasons" style="margin-bottom:0;">{reasons_html}</ul>'
         f"</div>"
-        f"</div>"
     )
-    with st.container(key=f"aa-verdict-{cls}-ledger"):
-        render_html(markup)
+    with st.container(key=f"aa-ledger-card-{cls}"):
+        head_l, head_r = st.columns([1, 0.25], vertical_alignment="center")
+        with head_l:
+            render_html(_ledger_detail_title_html(row))
+        with head_r, st.container(horizontal=True, horizontal_alignment="right"):
+            st.button("Clear selection", key="aa_ledger_clear", icon=":material/close:",
+                      on_click=clear_ledger_selection, width="content")
+        render_html(body)
+
+
+def _render_ledger_detail_empty() -> None:
+    with st.container(key="aa-ledger-card-empty"):
+        render_html('<div class="aa-ledger-detail-empty-line">Select a row to see the full decision.</div>')
 
 
 def _selected_ledger_id(grid: Any) -> Optional[int]:
@@ -1180,29 +1271,35 @@ def render_ledger_page():
         ]
         active_preset = st.session_state.get("aa_ledger_preset", "ALL")
 
-        p_cols = st.columns([0.8, 1.0, 1.25, 0.95, 1.0, 2.6, 1.3], vertical_alignment="center")
-        for idx, (p_key, p_lbl) in enumerate(preset_options):
-            with p_cols[idx]:
+        # One flex row: content-width presets, a search box that takes the remaining space,
+        # and an Export slot (filled after the grid, since it exports what the grid shows).
+        controls = st.container(horizontal=True, gap="small", vertical_alignment="center",
+                                key="aa-ledger-controls")
+        with controls:
+            for p_key, p_lbl in preset_options:
                 if st.button(
                     p_lbl,
                     key=f"aa_ledger_preset_{p_key}",
                     type="primary" if active_preset == p_key else "secondary",
-                    width="stretch",
+                    width="content",
                 ):
                     st.session_state["aa_ledger_preset"] = p_key
                     st.rerun()
-
-        with p_cols[5]:
             query = st.text_input(
-                "Search", placeholder="Search merchant, status, reason or order ID", key="aa_ledger_q",
-                icon=":material/search:", label_visibility="collapsed",
+                "Search ledger", placeholder="Search ledger", key="aa_ledger_q",
+                icon=":material/search:", label_visibility="collapsed", width="stretch",
             )
+            export_slot = st.container(width="content")
         quick_filter = (query or "").strip()
 
         filtered_rows = (
             rows if active_preset == "ALL"
             else [r for r in rows if (r.get("status") or "").upper() == active_preset]
         )
+
+        # Detail slot sits directly below the controls so a selection is visible without
+        # scrolling. It is filled after the grid renders (selection is only known then).
+        detail_slot = st.container(key="aa-ledger-detail-slot")
 
         grid = None
         fallback_id: Optional[int] = None
@@ -1226,18 +1323,19 @@ def render_ledger_page():
                 export_rows = [by_id[int(i)] for i in shown["id"].dropna() if int(i) in by_id]
         except Exception:
             pass
-        with p_cols[6]:
+        with export_slot:
             st.download_button(
                 "Export CSV", data=_ledger_csv(export_rows), file_name="agent_allowance_ledger.csv",
-                mime="text/csv", icon=":material/download:", width="stretch", key="aa_ledger_export",
+                mime="text/csv", icon=":material/download:", width="content", key="aa_ledger_export",
             )
 
         selected_id = _selected_ledger_id(grid) if grid is not None else fallback_id
         selected = next((r for r in rows if r["id"] == selected_id), None)
-        if selected:
-            _render_ledger_detail(selected)
-        elif grid is not None:
-            st.caption("Select a row to see the full proposal, every policy reason and the PayPal order.")
+        with detail_slot:
+            if selected:
+                _render_ledger_detail(selected)
+            else:
+                _render_ledger_detail_empty()
 
 
 # ==============================================================================

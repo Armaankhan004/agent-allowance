@@ -87,7 +87,8 @@ TOKENS: dict[str, str] = {
     "user-bubble-fg": "#1C1917",
     "grid-header-bg": "#F5F5F4",
     "grid-header-fg": "#1C1917",
-    "grid-selected-bg": "#F3EFF5",
+    "grid-selected-bg": "#E9E3EE",
+    "grid-hover-bg": "#F3EFF5",
     # Sidebar (white, 1px right border)
     "sidebar-bg": "#FFFFFF",
     "sidebar-surface": "#FAFAF9",
@@ -758,7 +759,7 @@ def render_section_title(title: str, subtitle: str = "") -> None:
 def get_summary_strip_html(metrics: dict) -> str:
     """
     Render the single-row white summary strip used on EVERY page:
-    - "Spent $X / $Y" with a thin 4px bar (ink fill, amber above 75%, red above 90%)
+    - "This month $X / $Y" (approved spend this calendar month) with a thin 4px bar (ink fill, amber above 75%, red above 90%)
     - "Pending N" with a small status dot
     - "Blocked N" with a small status dot
     Wraps cleanly on narrow widths.
@@ -778,7 +779,7 @@ def get_summary_strip_html(metrics: dict) -> str:
     return (
         f'<div class="aa-summary-strip">'
         f'<div class="aa-summary-spend">'
-        f'<span class="aa-summary-label">Spent</span>'
+        f'<span class="aa-summary-label">This month</span>'
         f'<span class="aa-summary-money">{money_html(spent)} <span class="aa-summary-cap">/ {money_html(budget)}</span></span>'
         f'<div class="aa-summary-bar-track" role="progressbar" aria-valuenow="{int(round(pct * 100))}" aria-valuemin="0" aria-valuemax="100">'
         f'<div class="aa-summary-bar-fill" style="width:{bar_width:.1f}%;background:{bar_color};"></div>'
@@ -822,7 +823,8 @@ def get_aggrid_theme_params() -> dict:
     Generate AG Grid theme parameters directly from `TOKENS`:
     - Header row `#F5F5F4` with ink (`#1C1917`) 500-weight text
     - White rows (`#FFFFFF`), hairline `#E7E5E4` borders
-    - Selected row `#F3EFF5`
+    - Selected row `#E9E3EE` (ink 13.9:1), hover `#F3EFF5`
+    - No per-cell focus border (selection is by row)
     """
     return {
         "backgroundColor": TOKENS["surface"],
@@ -831,8 +833,12 @@ def get_aggrid_theme_params() -> dict:
         "headerTextColor": TOKENS["grid-header-fg"],
         "headerFontWeight": 500,
         "oddRowBackgroundColor": TOKENS["surface"],
-        "rowHoverColor": TOKENS["canvas"],
+        "rowHoverColor": TOKENS["grid-hover-bg"],
         "selectedRowBackgroundColor": TOKENS["grid-selected-bg"],
+        "rowHeight": 44,
+        "cellHorizontalPadding": 14,
+        # Drives the (suppressed) cell focus border in AG Grid 34; transparent as a backstop.
+        "rangeSelectionBorderColor": "transparent",
         "borderColor": TOKENS["border"],
         "wrapperBorderRadius": 10,
         "fontFamily": TOKENS["font-sans"],
@@ -866,19 +872,85 @@ def get_aggrid_custom_css() -> dict:
             "color": f"{t['ink']} !important",
             "font-size": "13px !important",
         },
-        ".ag-row-hover": {
-            "background-color": f"{t['canvas']} !important",
+        ".ag-row-hover:not(.ag-row-selected)": {
+            "background-color": f"{t['grid-hover-bg']} !important",
         },
-        ".ag-row-selected": {
+        ".ag-row-selected, .ag-row-selected.ag-row-hover": {
             "background-color": f"{t['grid-selected-bg']} !important",
         },
+        # 3px plum accent on the selected row's left edge (inset shadow on the first cell,
+        # so it survives AG Grid's own ::before selection layer).
+        ".ag-row-selected .ag-cell[col-id='id']": {
+            "box-shadow": f"inset 3px 0 0 {t['plum']} !important",
+        },
+        ".ag-row-selected .aa-merchant": {
+            "font-weight": "500 !important",
+        },
+        # Muted text fails 4.5:1 on the tints; step it up to secondary inside tinted rows.
+        ".ag-row-selected .aa-muted, .ag-row-hover .aa-muted, .ag-row-selected .aa-more-chip, .ag-row-hover .aa-more-chip": {
+            "color": f"{t['text-secondary']} !important",
+        },
         ".ag-cell": {
-            "line-height": "1.45 !important",
-            "padding-top": "8px !important",
-            "padding-bottom": "8px !important",
             "color": f"{t['ink']} !important",
+            "white-space": "nowrap !important",
+            "overflow": "hidden !important",
+            "text-overflow": "ellipsis !important",
+        },
+        # No cell focus box anywhere (suppressCellFocus also stops AG Grid adding the class).
+        ".ag-cell-focus, .ag-cell-focus:not(.ag-cell-range-selected):focus-within, .ag-cell:focus, .ag-cell:focus-visible, .ag-cell:focus-within": {
+            "border-color": "transparent !important",
+            "outline": "none !important",
+            "box-shadow": "none !important",
+        },
+        ".ag-row-selected .ag-cell[col-id='id'].ag-cell-focus, .ag-row-selected .ag-cell[col-id='id']:focus-within": {
+            "box-shadow": f"inset 3px 0 0 {t['plum']} !important",
+        },
+        ".aa-muted": {
+            "color": f"{t['text-muted']} !important",
+        },
+        ".aa-reason-line": {
+            "display": "flex !important",
+            "align-items": "center !important",
+            "gap": "8px !important",
+            "min-width": "0 !important",
+            "height": "100% !important",
+        },
+        ".aa-reason-first": {
+            "flex": "0 1 auto !important",
+            "min-width": "0 !important",
+            "overflow": "hidden !important",
+            "text-overflow": "ellipsis !important",
+            "white-space": "nowrap !important",
+        },
+        ".aa-more-chip": {
+            "flex": "0 0 auto !important",
+            "padding": "1px 7px !important",
+            "border-radius": "9999px !important",
+            "background-color": f"{t['surface-muted']} !important",
+            "border": f"1px solid {t['border']} !important",
+            "color": f"{t['text-muted']} !important",
+            "font-size": "11.5px !important",
+            "line-height": "18px !important",
+        },
+        ".ag-floating-bottom .ag-row, .ag-floating-bottom .ag-row-hover": {
+            "background-color": f"{t['grid-header-bg']} !important",
+        },
+        ".aa-total-label": {
+            "color": f"{t['text-secondary']} !important",
+            "font-weight": "500 !important",
+        },
+        ".ag-tooltip": {
+            "white-space": "pre-line !important",
+            "max-width": "420px !important",
+            "font-size": "12.5px !important",
+            "line-height": "1.5 !important",
+        },
+        ".ag-cell[col-id='status']": {
+            "display": "flex !important",
+            "align-items": "center !important",
         },
         ".aa-pill": {
+            "line-height": "18px !important",
             "display": "inline-flex !important",
             "align-items": "center !important",
             "padding": "2px 8px !important",
@@ -1896,6 +1968,110 @@ header[data-testid="stHeader"] {{
     border-color: {t["plum"]} !important;
     box-shadow: 0 0 0 2px {t["focus-ring"]} !important;
     outline: none !important;
+}}
+
+/* Ledger search: ONE border on Streamlit's root element, icon inside, 36px text inset */
+.st-key-aa_ledger_q [data-testid="stTextInputRootElement"] {{
+    position: relative !important;
+    background: {t["surface"]} !important;
+    border: 1px solid {t["border-strong"]} !important;
+    border-radius: {t["radius-input"]} !important;
+    box-shadow: none !important;
+    overflow: hidden !important;
+}}
+.st-key-aa_ledger_q [data-testid="stTextInputRootElement"]:focus-within {{
+    border-color: {t["plum"]} !important;
+    box-shadow: 0 0 0 2px {t["focus-ring"]} !important;
+}}
+.st-key-aa_ledger_q [data-testid="stTextInputRootElement"] > div:has([data-testid="stTextInputIcon"]) {{
+    position: absolute !important;
+    left: 12px !important;
+    top: 50% !important;
+    transform: translateY(-50%) !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+    pointer-events: none !important;
+    z-index: 1 !important;
+    color: {t["text-muted"]} !important;
+}}
+.st-key-aa_ledger_q [data-testid="stTextInput"] input,
+.st-key-aa_ledger_q [data-testid="stTextInput"] input:focus {{
+    border: none !important;
+    box-shadow: none !important;
+    outline: none !important;
+    background: transparent !important;
+    border-radius: 0 !important;
+    padding-left: 36px !important;
+    text-overflow: ellipsis !important;
+}}
+
+/* Ledger controls row: tighter content-width buttons so the row fits from ~1100px up */
+.st-key-aa-ledger-controls {{
+    flex-wrap: nowrap !important;
+}}
+.st-key-aa-ledger-controls [data-testid^="stBaseButton"],
+.st-key-aa-ledger-controls [data-testid="stDownloadButton"] button {{
+    padding-left: 12px !important;
+    padding-right: 12px !important;
+    white-space: nowrap !important;
+}}
+.st-key-aa-ledger-controls .st-key-aa_ledger_q {{
+    flex: 1 1 180px !important;
+    min-width: 160px !important;
+}}
+
+/* Ledger detail slot (above the grid): selected card or one muted line */
+[class*="st-key-aa-ledger-card-"] {{
+    background: {t["surface"]} !important;
+    border: 1px solid {t["border"]} !important;
+    border-left-width: 3px !important;
+    border-radius: {t["radius-card"]} !important;
+    padding: 8px 16px 12px 16px !important;
+    gap: 4px !important;
+    box-shadow: {t["shadow"]} !important;
+}}
+.st-key-aa-ledger-card-approved, .st-key-aa-ledger-card-executed {{ border-left-color: {t["approved-bar"]} !important; }}
+.st-key-aa-ledger-card-pending {{ border-left-color: {t["pending-bar"]} !important; }}
+.st-key-aa-ledger-card-blocked {{ border-left-color: {t["blocked-bar"]} !important; }}
+.st-key-aa-ledger-card-rejected {{ border-left-color: {t["rejected-bar"]} !important; }}
+.st-key-aa-ledger-card-empty {{
+    border: 1px dashed {t["border-strong"]} !important;
+    border-left-width: 1px !important;
+    box-shadow: none !important;
+    background: transparent !important;
+    min-height: 50px !important;
+    padding: 0 16px !important;
+    justify-content: center !important;
+}}
+[class*="st-key-aa-ledger-card-"] [data-testid="stMarkdownContainer"] {{
+    margin-bottom: 0 !important;
+}}
+.aa-ledger-detail-empty-line {{
+    color: {t["text-muted"]};
+    font-size: 13px;
+}}
+.aa-ledger-detail-title {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 500;
+    color: {t["ink"]};
+}}
+.aa-ledger-detail-title > span:first-child {{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}}
+.aa-ledger-detail-body {{
+    border-top: 1px solid {t["divider"]};
+    padding-top: 10px;
+}}
+.aa-ledger-detail-body .aa-kv {{
+    margin-bottom: 8px;
 }}
 
 [data-testid="stChatInput"] > div {{
