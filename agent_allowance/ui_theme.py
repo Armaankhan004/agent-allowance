@@ -670,10 +670,10 @@ def get_mode_pill_html(
     note: str | None = None,
     mode_note: str | None = None,
 ) -> str:
-    """Render a single neutral mode pill ('Mock mode' or 'Gemini live')."""
+    """Render a single neutral mode pill ('Demo mode' or 'Gemini live')."""
     is_live = (mode or "").lower() in ("live", "gemini")
     dot_cls = "aa-mode-dot-live" if is_live else "aa-mode-dot-mock"
-    label = "Gemini live" if is_live else "Mock mode"
+    label = "Gemini live" if is_live else "Demo mode"
     final_note = note if note is not None else mode_note
     note_span = f' <span class="aa-mode-note">· {html_text(final_note)}</span>' if final_note else ""
     return (

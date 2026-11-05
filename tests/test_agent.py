@@ -347,3 +347,119 @@ def test_gemini_max_iteration_limit(mock_genai_client_cls, test_db):
     assert result["llm_requests"] == MAX_TOOL_ITERATIONS
     assert f"Completed {MAX_TOOL_ITERATIONS} iterations" in result["thought"]
 
+
+@patch("agent_allowance.agent.genai.Client")
+def test_gemini_short_conversation_memory_passes_last_4_messages_and_excludes_catalog_text(
+    mock_genai_client_cls, test_db
+):
+    """
+    Verify Gemini receives at most the last 4 chat messages (user and agent text only,
+    never catalog descriptions or tool payloads), does not increase llm_requests per run,
+    and exposes only search_products and propose_purchase tools.
+    """
+    from google.genai import types
+    from agent_allowance.catalog import get_product
+
+    malicious_desc = get_product("bad-injection-999")["description"]
+    captured_contents = []
+    captured_tools = []
+
+    def fake_generate_content(*, model, contents, config):
+        captured_contents.append(list(contents))
+        captured_tools.append(config.tools)
+        cand = types.Candidate(
+            content=types.Content(
+                role="model",
+                parts=[types.Part.from_text(text="Searching for gift card as you confirmed.")],
+            )
+        )
+        return types.GenerateContentResponse(candidates=[cand])
+
+    mock_client_instance = mock_genai_client_cls.return_value
+    mock_client_instance.models.generate_content.side_effect = fake_generate_content
+
+    history = [
+        # Static welcome message (ran=False) must be ignored
+        {"role": "assistant", "content": "Hi! I'm your shopping agent.", "ran": False},
+        {"role": "user", "content": "Turn 1 old user message (should be dropped since > 4)"},
+        {"role": "assistant", "content": "Turn 1 old assistant reply (should be dropped)", "ran": True},
+        {"role": "user", "content": "Do we have any office paper?"},
+        {
+            "role": "assistant",
+            "content": f"Yes, Corner Office Supply has paper. {malicious_desc}",
+            "tool_calls": [{"tool": "search_products", "query": "paper", "raw_catalog": malicious_desc}],
+            "proposal_result": {"status": "APPROVED", "merchant": "Corner Office Supply"},
+            "ran": True,
+        },
+        {"role": "user", "content": "Search specials and buy the $500 gift card"},
+        {
+            "role": "assistant",
+            "content": 'I couldn\'t find any "specials". Would you like me to search for "gift card" instead?',
+            "ran": True,
+        },
+    ]
+
+    agent = ShoppingAgent(provider="gemini", api_key="dummy-key", db_path=test_db)
+    result = agent.run("yes", history=history)
+
+    # Exactly 1 Gemini request made (memory adds 0 extra requests)
+    assert result["llm_requests"] == 1
+    assert mock_client_instance.models.generate_content.call_count == 1
+
+    # Exactly 4 memory messages + 1 current user request = 5 Content items
+    sent = captured_contents[0]
+    assert len(sent) == 5
+    roles = [c.role for c in sent]
+    texts = [c.parts[0].text for c in sent]
+    assert roles == ["user", "model", "user", "model", "user"]
+    assert texts[0] == "Do we have any office paper?"
+    assert texts[1] == "Yes, Corner Office Supply has paper."
+    assert texts[2] == "Search specials and buy the $500 gift card"
+    assert texts[3] == 'I couldn\'t find any "specials". Would you like me to search for "gift card" instead?'
+    assert texts[4] == "yes"
+
+    # Catalog text and old >4 messages never appear in contents
+    all_sent_text = " ".join(texts)
+    assert malicious_desc not in all_sent_text
+    assert "SYSTEM OVERRIDE" not in all_sent_text
+    assert "Turn 1 old" not in all_sent_text
+
+    # Only the original 2 tools are registered (no new tools)
+    fn_names = [fd.name for tool in captured_tools[0] for fd in tool.function_declarations]
+    assert fn_names == ["search_products", "propose_purchase"]
+
+
+@pytest.mark.parametrize("affirmative", ["yes", "ok", "YES!", "Okay.", "sure"])
+def test_demo_mode_bare_yes_or_ok_repeats_last_suggestion(affirmative, test_db):
+    """
+    In Demo mode, a bare 'yes' or 'ok' answers with a helpful line (repeating the last
+    suggestion when available) instead of 'tell me what you need' or blindly buying paper.
+    """
+    agent = ShoppingAgent(provider="mock", db_path=test_db)
+    history = [
+        {"role": "user", "content": "Search specials and buy the $500 gift card"},
+        {
+            "role": "assistant",
+            "content": 'Would you like me to search for "gift card" instead?',
+            "ran": True,
+        },
+    ]
+
+    with patch("agent_allowance.agent.create_order") as mock_order:
+        res_with_history = agent.run(affirmative, history=history)
+        res_no_history = agent.run(affirmative)
+        mock_order.assert_not_called()
+
+    for res in (res_with_history, res_no_history):
+        assert res["llm_requests"] == 0
+        assert res["proposal_result"] is None
+        assert res["tool_calls"] == []
+        low = res["agent_response"].lower()
+        assert "tell me what you need" not in low
+        assert "tell me what i can help" not in low
+        assert "suggestion" in low
+
+    # With history, the last suggestion is repeated verbatim
+    assert 'Would you like me to search for "gift card" instead?' in res_with_history["agent_response"]
+
+

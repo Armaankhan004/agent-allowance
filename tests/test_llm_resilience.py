@@ -139,7 +139,7 @@ def test_agent_stops_when_request_budget_is_spent(mock_client_cls, test_db):
     assert client.models.generate_content.call_count == 2
     assert result["llm_requests"] == 2
     assert result["error_kind"] == "session_cap"
-    assert "Mock mode" in result["error_message"]
+    assert "Demo mode" in result["error_message"]
 
 
 @patch("agent_allowance.agent.genai.Client")
@@ -183,7 +183,7 @@ def test_parse_structured_client_error_uses_retry_info():
     assert parsed["kind"] == "quota"
     assert parsed["retry_after_seconds"] == 37.0
     assert "37 seconds" in parsed["message"]
-    assert "Mock mode" in parsed["message"]
+    assert "Demo mode" in parsed["message"]
     assert SECRET_KEY not in parsed["message"]
     assert "RESOURCE_EXHAUSTED" not in parsed["message"]
     assert "{" not in parsed["message"]
@@ -237,7 +237,7 @@ def test_agent_429_is_not_retried_and_returns_friendly_message(mock_client_cls, 
         assert SECRET_KEY not in result[field]
     assert "RESOURCE_EXHAUSTED" not in result["agent_response"]
     assert "Switch" not in result["agent_response"]  # button text is UI-only
-    assert "Mock mode" in result["error_message"]
+    assert "Demo mode" in result["error_message"]
 
 
 @patch("agent_allowance.agent.time.sleep")
@@ -330,3 +330,16 @@ def test_outcome_label_for_quota_error():
 def test_shipped_streamlit_config_has_no_run_on_save():
     config = (Path(__file__).resolve().parent.parent / ".streamlit" / "config.toml").read_text()
     assert "runOnSave" not in config
+
+
+def test_demo_mode_labels_and_explanation():
+    from agent_allowance.app import MODE_EXPLANATION, MODE_LABELS, gemini_caps_caption
+    from agent_allowance.ui_theme import get_mode_pill_html
+
+    assert MODE_LABELS["mock"] == "Demo mode"
+    assert MODE_LABELS["gemini"] == "Gemini"
+    assert MODE_EXPLANATION == "Demo mode uses a scripted agent so demos are reliable. Gemini mode runs the real model."
+    assert "Demo mode" in get_mode_pill_html("mock")
+    assert "Mock mode" not in get_mode_pill_html("mock")
+    assert "Demo mode" in gemini_caps_caption(10)
+    assert "Mock mode" not in gemini_caps_caption(10)
