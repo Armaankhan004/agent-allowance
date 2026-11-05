@@ -7,7 +7,7 @@ Unit tests for the non-UI helpers and Redesign v4 Calm Neutral palette/contrast 
   and ink on the #F5F5F4 grid header
 - gauge_level / gauge_color: summary bar percent-to-color thresholds (ink < 75%, amber <= 90%, red > 90%)
 - pipeline_states: Agent -> Rules -> PayPal node states for each run phase
-- AG Grid theme params generated from TOKENS (#F5F5F4 header with ink 500-weight text, white rows, #E7E5E4 borders, #F3EFF5 selected row)
+- AG Grid theme params generated from TOKENS (#F5F5F4 header with ink 500-weight text, white rows, #E7E5E4 borders, #E9E3EE selected row, #F3EFF5 hover)
 - No stray old violet, peach, cream, blue, indigo, or slate hex values in app.py, ui_theme.py, assets, or config.toml
 """
 
@@ -74,7 +74,8 @@ EXPECTED_V4_TOKENS = {
     "executed-bar": "#5E9B6E",
     "grid-header-bg": "#F5F5F4",
     "grid-header-fg": "#1C1917",
-    "grid-selected-bg": "#F3EFF5",
+    "grid-selected-bg": "#E9E3EE",
+    "grid-hover-bg": "#F3EFF5",
     "user-bubble-bg": "#F1F0EE",
     "user-bubble-fg": "#1C1917",
 }
@@ -173,7 +174,9 @@ def test_aggrid_theme_uses_tokens():
     assert params["backgroundColor"] == "#FFFFFF" == TOKENS["surface"]
     assert params["oddRowBackgroundColor"] == "#FFFFFF" == TOKENS["surface"]
     assert params["borderColor"] == "#E7E5E4" == TOKENS["border"]
-    assert params["selectedRowBackgroundColor"] == "#F3EFF5" == TOKENS["grid-selected-bg"]
+    assert params["selectedRowBackgroundColor"] == "#E9E3EE" == TOKENS["grid-selected-bg"]
+    assert params["rowHoverColor"] == "#F3EFF5" == TOKENS["grid-hover-bg"]
+    assert params["rowHeight"] == 44
     assert contrast_ratio(params["headerTextColor"], params["headerBackgroundColor"]) >= 4.5
     assert contrast_ratio(params["foregroundColor"], params["backgroundColor"]) >= 4.5
     assert contrast_ratio(params["foregroundColor"], params["selectedRowBackgroundColor"]) >= 4.5
