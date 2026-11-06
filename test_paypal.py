@@ -6,12 +6,9 @@ Creates a $5.00 USD order, outputs the buyer approval link, and optionally captu
 
 import sys
 from agent_allowance.config import Config
-from agent_allowance.paypal_client import (
-    create_order,
-    capture_order,
-    PayPalConfigError,
-    PayPalAPIError,
-)
+from agent_allowance.paypal_client import PayPalConfigError, PayPalAPIError
+# Sandbox-only guard: refuses to call PayPal when PAYPAL_MODE is not "sandbox".
+from agent_allowance.paypal_guard import create_order, capture_order
 
 
 def main():

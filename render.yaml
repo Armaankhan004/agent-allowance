@@ -1,0 +1,52 @@
+# ==============================================================================
+# Agent Allowance - Render service (DOCUMENTATION ONLY)
+#
+# The live web service was created MANUALLY in the Render dashboard and
+# auto-deploys from `main`. It is not linked to this file as a Blueprint, so
+# editing this file changes nothing on Render. It records the settings the
+# service uses; the dashboard is the source of truth.
+#
+# Free instances have an EPHEMERAL disk: the SQLite database (ledger, rule
+# edits, daily Gemini counter) is wiped on every restart, redeploy and
+# spin-down. To keep data, attach a persistent disk and set DB_PATH to a file
+# on it (e.g. /var/data/agent_allowance.db).
+# ==============================================================================
+services:
+  - type: web
+    name: agent-allowance
+    runtime: python
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      # --- Secrets: set in the Render dashboard, never committed ---
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      # Public URL of the service, used for PayPal return/cancel links.
+      - key: APP_BASE_URL
+        sync: false
+
+      # --- Non-secret settings ---
+      - key: PAYPAL_MODE
+        value: sandbox            # anything else disables all PayPal calls
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_MODEL
+        value: gemini-2.5-flash
+      - key: DEFAULT_MODE
+        value: mock               # new sessions start in Demo mode
+      - key: LLM_SESSION_CAP
+        value: "10"
+      - key: LLM_DAILY_CAP
+        value: "30"               # shared across all visitors, resets at midnight UTC
+      - key: DEMO_PUBLIC
+        value: "true"
+      - key: STREAMLIT_CLIENT_SHOW_ERROR_DETAILS
+        value: none
+      # DB_PATH is left unset (defaults to agent_allowance.db in the project root).

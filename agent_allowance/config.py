@@ -39,9 +39,18 @@ class Config:
     # Public demo: gate Reset, never show raw exceptions.
     DEMO_PUBLIC: bool = parse_bool(os.getenv("DEMO_PUBLIC"))
 
+    # Max real Gemini requests per UTC day across ALL visitors (stored in SQLite).
+    # When it is spent, every session uses Demo mode until midnight UTC. Demo mode is never capped.
+    LLM_DAILY_CAP: int = parse_session_cap(os.getenv("LLM_DAILY_CAP"), default=30)
+
     # Storage & App Settings
-    DATABASE_PATH: str = os.getenv(
-        "DATABASE_PATH", str(BASE_DIR / "agent_allowance.db")
+    # DB_PATH wins; DATABASE_PATH is the older name and still works. Default is unchanged.
+    # On a free Render instance the disk is ephemeral: this file resets on restart,
+    # redeploy and spin-down unless DB_PATH points at a persistent disk.
+    DATABASE_PATH: str = (
+        os.getenv("DB_PATH")
+        or os.getenv("DATABASE_PATH")
+        or str(BASE_DIR / "agent_allowance.db")
     )
     DEFAULT_CURRENCY: str = os.getenv("DEFAULT_CURRENCY", "USD")
     APP_ENV: str = os.getenv("APP_ENV", "development")
@@ -50,6 +59,10 @@ class Config:
     @classmethod
     def llm_api_key(cls) -> str:
         return cls.LLM_API_KEY or os.getenv("GEMINI_API_KEY", "")
+
+    @classmethod
+    def paypal_mode_is_sandbox(cls) -> bool:
+        return cls.PAYPAL_MODE.strip().lower() == "sandbox"
 
     @classmethod
     def validate_paypal_config(cls) -> bool:

@@ -36,7 +36,6 @@ from agent_allowance.db import (
     get_ledger_rows,
     parse_reasons,
     get_pending_transactions,
-    reset_demo_transactions,
     get_transaction_by_order_id,
 )
 from agent_allowance.policy_engine import (
@@ -58,7 +57,15 @@ from agent_allowance.llm_guard import (
     requests_remaining,
     resolve_default_mode,
 )
-from agent_allowance.paypal_client import get_order_status
+from agent_allowance.llm_quota import daily_remaining, make_request_gate
+from agent_allowance.demo_seed import DEMO_DATA_LABEL, is_demo_row, reset_and_reseed, seed_demo_data
+# PayPal calls go through the sandbox-only guard (refuses when PAYPAL_MODE != sandbox).
+from agent_allowance.paypal_guard import (
+    STATUS_MISSING_CREDENTIALS,
+    STATUS_WRONG_MODE,
+    get_order_status,
+    paypal_status,
+)
 from agent_allowance.ui_theme import (
     inject_theme_css,
     get_status_pill_html,
@@ -174,7 +181,7 @@ def friendly_agent_error(result: Dict[str, Any]) -> Optional[str]:
     """One user-facing line for a failed agent run (never the raw provider payload)."""
     if not result.get("error"):
         return None
-    if result.get("error_kind") in ("quota", "session_cap", "config") and result.get("error_message"):
+    if result.get("error_kind") in ("quota", "session_cap", "daily_cap", "config") and result.get("error_message"):
         return result["error_message"]
     return safe_error_text(result["error"])
 
@@ -394,8 +401,8 @@ def render_example_cards() -> None:
 @st.dialog("Reset demo data?")
 def confirm_reset_dialog() -> None:
     st.markdown(
-        "This permanently deletes **all ledger rows and audit logs**. "
-        "Your spending rules are kept."
+        "This permanently deletes **all ledger rows and audit logs**, then restores the "
+        "two sample demo rows. Your spending rules are kept."
     )
     c1, c2 = st.columns(2)
     with c1:
@@ -404,11 +411,12 @@ def confirm_reset_dialog() -> None:
     with c2:
         with st.container(key="aa-confirm-reset"):
             if st.button("Reset data", key="aa_reset_confirm", type="primary", width="stretch"):
-                deleted_count = reset_demo_transactions()
+                deleted_count = reset_and_reseed()
                 st.session_state["messages"] = []
                 st.session_state.pop("last_attack_result", None)
                 st.session_state.pop("attack_triggered", None)
-                queue_toast(f"Cleared {deleted_count} ledger rows. Demo is ready.", ":material/restart_alt:")
+                queue_toast(f"Cleared {deleted_count} ledger rows and restored the sample rows. Demo is ready.",
+                            ":material/restart_alt:")
                 st.rerun()
 
 
@@ -428,10 +436,25 @@ def gemini_caps_caption(cap: int) -> str:
             "when either runs out, Demo mode keeps working.")
 
 
+def global_daily_remaining() -> int:
+    """Real Gemini requests left today across all visitors (0 if the counter can't be read)."""
+    try:
+        return daily_remaining(Config.LLM_DAILY_CAP)
+    except Exception:
+        return 0
+
+
+def daily_cap_note(cap: int) -> str:
+    noun = "request" if cap == 1 else "requests"
+    return (f"<b>Today's Gemini limit is used up.</b> This public demo allows {cap} real Gemini {noun} "
+            "per day across all visitors, so every session uses Demo mode until it resets at midnight UTC.")
+
+
 def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
     """
     Sidebar Demo mode / Gemini toggle with the per-session Gemini request meter.
-    Returns (active mode, pill note). Once the cap is spent the session is pinned to Demo mode.
+    Returns (active mode, pill note). Once the session cap or the shared daily cap is spent,
+    the session is pinned to Demo mode.
     """
     state = st.session_state
     cap = Config.LLM_SESSION_CAP
@@ -440,18 +463,21 @@ def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
         state["aa_mode"] = resolve_default_mode(Config.DEFAULT_MODE, Config.llm_api_key(), Config.LLM_PROVIDER)
     remaining = requests_remaining(state, cap)
     capped = has_key and remaining <= 0
-    if capped or not has_key:
+    daily_capped = has_key and global_daily_remaining() <= 0
+    if capped or daily_capped or not has_key:
         state["aa_mode"] = MODE_MOCK
 
     with st.sidebar:
         render_html('<div class="aa-side-label">Agent mode</div>')
         st.radio(
             "Agent mode", MODES, key="aa_mode", format_func=MODE_LABELS.get, horizontal=True,
-            label_visibility="collapsed", disabled=capped or not has_key,
+            label_visibility="collapsed", disabled=capped or daily_capped or not has_key,
         )
         st.caption(MODE_EXPLANATION)
         if not has_key:
             st.caption("Gemini needs LLM_API_KEY. Demo mode runs offline with no limits.")
+        elif daily_capped:
+            render_html(f'<div class="aa-side-note">{daily_cap_note(Config.LLM_DAILY_CAP)}</div>')
         elif capped:
             render_html(
                 '<div class="aa-side-note"><b>Gemini limit reached.</b> This session used all '
@@ -465,8 +491,10 @@ def render_sidebar_mode_control() -> Tuple[str, Optional[str]]:
                 st.caption(gemini_caps_caption(cap))
         st.divider()
 
-    active = effective_mode(state["aa_mode"], state, cap)
+    active = MODE_MOCK if daily_capped else effective_mode(state["aa_mode"], state, cap)
     state["aa_active_mode"] = active
+    if daily_capped:
+        return active, "Daily Gemini limit reached"
     return active, ("Gemini limit reached" if capped else None)
 
 
@@ -504,9 +532,13 @@ def render_sidebar_demo_tools() -> None:
                 """
             )
 
-        paypal_ready = Config.validate_paypal_config()
+        pp = paypal_status()["status"]
+        paypal_ready = pp == "ok"
         dot = "ok" if paypal_ready else "warn"
-        label = "PayPal sandbox connected" if paypal_ready else "PayPal sandbox: add .env credentials"
+        label = {
+            STATUS_WRONG_MODE: "PayPal disabled: PAYPAL_MODE is not sandbox",
+            STATUS_MISSING_CREDENTIALS: "PayPal sandbox: credentials not set",
+        }.get(pp, "PayPal sandbox connected")
         render_html(f'<div class="aa-side-status"><span class="aa-sdot {dot}"></span>{label}</div>')
 
 
@@ -604,6 +636,8 @@ def render_chat_page():
             mode = st.session_state.get("aa_active_mode", MODE_MOCK)
             agent = ShoppingAgent(provider=mode)
             budget = requests_remaining(st.session_state, Config.LLM_SESSION_CAP) if mode == MODE_GEMINI else None
+            # Shared daily cap across all visitors: each real Gemini request claims a slot in SQLite.
+            gate = make_request_gate(Config.LLM_DAILY_CAP) if mode == MODE_GEMINI else None
 
             try:
                 result = agent.run(
@@ -612,6 +646,7 @@ def render_chat_page():
                     on_policy_decision=on_policy_callback,
                     max_llm_requests=budget,
                     history=prior_history,
+                    llm_request_gate=gate,
                 )
             except Exception as e:
                 result = {"error": str(e), "tool_calls": live_tool_calls, "proposal_result": None}
@@ -622,7 +657,7 @@ def render_chat_page():
             error_text = friendly_agent_error(result)
             notice = (
                 result.get("error_message")
-                if result.get("error_kind") == "session_cap" and not error_text else None
+                if result.get("error_kind") in ("session_cap", "daily_cap") and not error_text else None
             )
 
             msg = {
@@ -644,7 +679,7 @@ def render_chat_page():
 
     # Real LLM requests changed the session budget: rerun so the sidebar meter and
     # mode pill (rendered before this page) show the new count.
-    if used:
+    if used or result.get("error_kind") == "daily_cap":
         st.rerun()
 
 
@@ -701,6 +736,8 @@ def render_approvals_page():
             ledger_id = item["id"]
             reasons_list = _parse_reasons(item.get("reasons"))
             subtitle_str = f"Request #{ledger_id} · {item.get('created_at') or 'Decided by rules, not the agent'}"
+            if is_demo_row(item):
+                subtitle_str += " · Demo data"
 
             with st.container(key=f"aa-verdict-pending-{ledger_id}"):
                 render_html(
@@ -1206,6 +1243,13 @@ def _render_ledger_detail(row: Dict[str, Any]) -> None:
     elif item:
         extra_kv = f'<div><div class="aa-label">Item</div><div class="aa-v">{html_text(item)}</div></div>'
 
+    demo_block = (
+        f'<div class="aa-demo-data-note" style="margin:0 0 10px 0;padding:6px 10px;border-radius:8px;'
+        f'background:var(--aa-canvas);border:1px solid var(--aa-border);font-size:12.5px;color:var(--aa-text-secondary);">'
+        f'{html_text(DEMO_DATA_LABEL)}</div>'
+        if is_demo_row(row) else ""
+    )
+
     agent_reason_block = (
         f'<div class="aa-label">Agent&#39;s reason</div><p class="aa-reason" style="margin:0 0 8px 0;font-size:13px;">{html_text(agent_reason)}</p>'
         if agent_reason else ""
@@ -1213,6 +1257,7 @@ def _render_ledger_detail(row: Dict[str, Any]) -> None:
 
     body = (
         f'<div class="aa-ledger-detail-body">'
+        f"{demo_block}"
         f'<div class="aa-kv">'
         f'<div><div class="aa-label">Amount</div><div class="aa-v big">{money_html(row["amount"], row["currency"])}</div></div>'
         f'<div><div class="aa-label">Category</div><div class="aa-v">{html_text(row["category"])}</div></div>'
@@ -1560,6 +1605,26 @@ def render_payment_return_panel(db_path: Optional[str] = None) -> None:
 # Main Application Router
 # ==============================================================================
 
+@st.cache_resource(show_spinner=False)
+def _seed_demo_data_once() -> bool:
+    """Seed demo rows into an empty ledger once per server process (first start)."""
+    try:
+        seed_demo_data()
+        return True
+    except Exception:
+        # Seeding is a nicety: never block the app on it.
+        return False
+
+
+def render_paypal_banner() -> None:
+    """Friendly banner when PayPal is disabled (wrong mode) or not configured (no credentials)."""
+    pp = paypal_status()
+    if pp["status"] == STATUS_WRONG_MODE:
+        st.error(md_escape(pp["message"]), icon=":material/block:")
+    elif pp["status"] == STATUS_MISSING_CREDENTIALS:
+        st.info(md_escape(pp["message"]), icon=":material/info:")
+
+
 def main():
     """Main application launcher with st.navigation routing and frame elements."""
     st.set_page_config(
@@ -1569,7 +1634,10 @@ def main():
         initial_sidebar_state="expanded",
     )
 
+    db_dir = Path(Config.DATABASE_PATH).expanduser().parent
+    db_dir.mkdir(parents=True, exist_ok=True)
     init_db()
+    _seed_demo_data_once()
     inject_theme_css()
     if LOGO_PATH.exists():
         st.logo(str(LOGO_PATH), size="large")
@@ -1594,6 +1662,8 @@ def main():
     metrics_slot = st.empty()
     with metrics_slot.container():
         render_metrics_banner(compact_strip=True)
+
+    render_paypal_banner()
 
     # Render payment return banner if returning from PayPal
     render_payment_return_panel()
