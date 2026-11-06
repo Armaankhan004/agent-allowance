@@ -20,7 +20,8 @@ from .llm_guard import parse_llm_error, redact
 from .db import get_db_connection
 from .catalog import search_products, get_product
 from .policy_engine import evaluate_proposal, Decision
-from .paypal_client import create_order, capture_order
+# PayPal calls go through the sandbox-only guard (refuses when PAYPAL_MODE != sandbox).
+from .paypal_guard import create_order, capture_order
 
 try:
     from google import genai
@@ -309,6 +310,12 @@ def create_order_for_approved(
     }
 
 
+DAILY_CAP_MESSAGE = (
+    "Today's shared Gemini limit for this demo is used up, so the agent switched to Demo mode. "
+    "It resets at midnight UTC."
+)
+
+
 # ==============================================================================
 # Provider-Agnostic Shopping Agent
 # ==============================================================================
@@ -419,6 +426,7 @@ class ShoppingAgent:
         on_policy_decision: Optional[Callable[[Dict[str, Any]], None]] = None,
         max_llm_requests: Optional[int] = None,
         history: Optional[List[Dict[str, Any]]] = None,
+        llm_request_gate: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         Process a user shopping request.
@@ -431,6 +439,9 @@ class ShoppingAgent:
             on_policy_decision: Optional callback for each policy decision (decision_dict)
             max_llm_requests: Optional budget of real LLM requests for this run (None = unlimited)
             history: Optional list of recent chat messages (up to last 4 user/agent text turns)
+            llm_request_gate: Optional callable run before every real LLM request. It must
+                return True to allow the request (e.g. after claiming a slot in a shared daily
+                cap); False stops the run with error_kind "daily_cap".
 
         Every result includes "llm_requests": the number of real LLM requests made.
         """
@@ -452,6 +463,7 @@ class ShoppingAgent:
                 on_policy_decision=on_policy_decision,
                 max_llm_requests=max_llm_requests,
                 history=history,
+                llm_request_gate=llm_request_gate,
             )
         else:
             return self._run_live_llm(user_request)
@@ -637,6 +649,7 @@ class ShoppingAgent:
         on_policy_decision: Optional[Callable[[Dict[str, Any]], None]] = None,
         max_llm_requests: Optional[int] = None,
         history: Optional[List[Dict[str, Any]]] = None,
+        llm_request_gate: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         Execute shopping request using official Google GenAI SDK (google-genai).
@@ -786,6 +799,18 @@ class ShoppingAgent:
                         "error_kind": "session_cap",
                         "error_message": cap_msg,
                         "thought": f"Stopped at iteration {iteration}: session LLM request cap reached.",
+                        "tool_calls": recorded_tool_calls,
+                        "proposal_result": last_proposal_result,
+                        "agent_response": _proposal_summary() if last_proposal_result else cap_msg,
+                        "llm_requests": llm_requests,
+                    }
+                if llm_request_gate is not None and not llm_request_gate():
+                    cap_msg = DAILY_CAP_MESSAGE
+                    return {
+                        "error": None if last_proposal_result else cap_msg,
+                        "error_kind": "daily_cap",
+                        "error_message": cap_msg,
+                        "thought": f"Stopped at iteration {iteration}: shared daily LLM request cap reached.",
                         "tool_calls": recorded_tool_calls,
                         "proposal_result": last_proposal_result,
                         "agent_response": _proposal_summary() if last_proposal_result else cap_msg,
